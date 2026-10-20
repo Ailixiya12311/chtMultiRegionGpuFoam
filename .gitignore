@@ -5,8 +5,9 @@
 app/**/Make/linux*
 cases/
 
+# Build output of lib/Makefile (build/omp, build/cuda): build from source with ./Allwmake
+build/
+third_party/cccl-3.0.3/
+
 # Local NAS host / key / paths for tools/nas.sh
 tools/nas.env
-
-# Keep compiled binaries in build/omp and build/cuda, ignore object files
-build/**/*.o
