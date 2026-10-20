@@ -5,5 +5,8 @@
 app/**/Make/linux*
 cases/
 
+# Local NAS host / key / paths for tools/nas.sh
+tools/nas.env
+
 # Keep compiled binaries in build/omp and build/cuda, ignore object files
 build/**/*.o

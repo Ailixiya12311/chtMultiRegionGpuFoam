@@ -40,7 +40,7 @@ gpu_cht_of_r1/
     m1.sh ~ m7.sh                   M1～M7 分级验证脚本
 ```
 
-NAS 环境：`user@gpu-host`，工作目录 `/path/to/work/gpu_cht_of_r1`（容器内挂载为 `/w`，Py 版只读挂载为 `/py`）。容器镜像 `local/openfoam2606-cuda`（OpenFOAM v2606 + g++ 13.3 + CUDA 12.8 挂载于 `/usr/local/cuda`），NAS 显卡 **NVIDIA GeForce RTX 3080 (20 GB VRAM, `sm_86`, Driver 580.142)** 通过 `--gpus all` 直通容器。
+NAS 环境：主机、密钥、工作目录和镜像名写在 `tools/nas.env`（不入库，照 `tools/nas.env.example` 填），工作目录下的 `gpu_cht_of_r1` 在容器内挂载为 `/w`，Py 版只读挂载为 `/py`。容器镜像（OpenFOAM v2606 + g++ 13.3 + CUDA 12.8 挂载于 `/usr/local/cuda`），NAS 显卡 **NVIDIA GeForce RTX 3080 (20 GB VRAM, `sm_86`, Driver 580.142)** 通过 `--gpus all` 直通容器。
 
 ## 2. 核心设计要点与对齐的 OpenFOAM v2606 细节
 
