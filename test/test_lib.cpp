@@ -214,17 +214,23 @@ int main()
         MeshIn m = box(n, n, n, 1.0, 0);
         std::vector<double> Su(m.nC, 1.0*m.V[0]*100.0);
         std::vector<double> ref;
-        const char* names[] = {"PCG+Jacobi", "PCG+AMG", "BiCGStab+AMG"};
-        for (int t = 0; t < 3; ++t)
+        const char* names[] = {"PCG+Jacobi", "PCG+AMG", "BiCGStab+AMG", "PCG+DIC", "BiCGStab+DILU", "smooth GS",
+                               "smooth symGS"};
+        const SolverCtl::Method meth[] = {SolverCtl::PCG, SolverCtl::PCG, SolverCtl::PBICGSTAB, SolverCtl::PCG,
+                                          SolverCtl::PBICGSTAB, SolverCtl::SMOOTH, SolverCtl::SMOOTH};
+        const SolverCtl::Precond pre[] = {SolverCtl::JACOBI, SolverCtl::AMG, SolverCtl::AMG, SolverCtl::DILU,
+                                          SolverCtl::DILU, SolverCtl::NONE, SolverCtl::NONE};
+        for (int t = 0; t < 7; ++t)
         {
             Engine E(m);
             setup(E, m, {1.0}, 1.0, 0.0);
             E.put(A::Su, Su);
             SolverCtl s;
-            s.method = t == 2 ? SolverCtl::PBICGSTAB : SolverCtl::PCG;
-            s.precond = t == 0 ? SolverCtl::JACOBI : SolverCtl::AMG;
+            s.method = meth[t];
+            s.precond = pre[t];
+            s.smoother = t == 6 ? SolverCtl::SYMGS : SolverCtl::GS;
             s.tol = 1e-12;
-            s.maxIter = 5000;
+            s.maxIter = t >= 5 ? 100000 : 5000;
             const double t0 = now();
             SolveInfo inf = E.energySolve(0.0, s, false);
             const double t1 = now();
@@ -232,7 +238,7 @@ int main()
             double d = 0;
             if (ref.empty()) ref = T;
             for (int c = 0; c < m.nC; ++c) d = std::max(d, std::fabs(T[c] - ref[c]));
-            printf("cube %d^3 %-13s res0 %.3e res %.3e iters %4d  %.3f s  max diff to PCG+Jacobi %.2e\n", n, names[t],
+            printf("cube %d^3 %-13s res0 %.3e res %.3e iters %5d  %.3f s  max diff to PCG+Jacobi %.2e\n", n, names[t],
                    inf.res0, inf.res, inf.iters, t1 - t0, d);
             if (d > 1e-7) { printf("  FAIL\n"); ++fails; }
         }

@@ -28,10 +28,16 @@ static scalar relaxFactor(const fvMesh& mesh, const word& name, bool finalIter, 
     return 0;
 }
 
-static void logSolve(const word& solver, const word& field, const gc::SolveInfo& si)
+static void logSolve(const fvMesh& mesh, const gc::SolverCtl& ctl, const word& field, const gc::SolveInfo& si)
 {
-    Info<< solver.c_str() << ":  Solving for " << field << ", Initial residual = " << si.res0
+    Info<< ctl.name.c_str() << ":  Solving for " << field << ", Initial residual = " << si.res0
         << ", Final residual = " << si.res << ", No Iterations " << si.iters << endl;
+    // mesh.data() solverPerformanceDict, as fvMatrix::solve leaves it (solverInfo, residualControl readers)
+    mesh.data().setSolverPerformance
+    (
+        field,
+        SolverPerformance<scalar>(ctl.name, field, si.res0, si.res, si.iters, gpuCht::converged(ctl, si))
+    );
 }
 
 // ----------------------------------------------------------------------------------------- setup
@@ -203,6 +209,10 @@ void FluidCoupling::setup(FluidRegion& f)
     {
         fi.inertIndex = fp.inertIndex;
         fi.convY = divScheme(mesh, "div(phi,Yi_h)", "Yi_h", 0xF, bnd, coef);
+        // the multivariate convection scheme of v2606 knows only Gauss ("Unknown convection type bounded")
+        if (bnd)
+            FatalErrorInFunction << where << ": div(phi,Yi_h): bounded is not a multivariate convection scheme"
+                << " in OpenFOAM v2606 (valid: Gauss)" << exit(FatalError);
         fi.convYK = coef;
         fi.boundedY = bnd;
         fi.limitKH = gradLimitK(mesh, "grad(h)");
@@ -485,6 +495,18 @@ void FluidCoupling::setup(FluidRegion& f)
             const dictionary pd_bc = patchDict(Pp);
             p0Field = scalarField("p0", pd_bc, Pp.size());
         }
+        else if (pt == "totalPressure")
+        {
+            // v2606 totalPressure on p_rgh, variable-density form (psi none): p_rgh = p0 - 0.5 rho neg(phi) |U|^2,
+            // i.e. prghTotalPressure without the rho gh term (the outside is hydrostatic at the face density)
+            pk = gc::PK_TOTALP;
+            const dictionary pd_bc = patchDict(Pp);
+            if (pd_bc.getOrDefault<word>("psi", "none") != "none" || pd_bc.getOrDefault<word>("U", "U") != "U"
+             || pd_bc.getOrDefault<word>("phi", "phi") != "phi" || pd_bc.getOrDefault<word>("rho", "rho") != "rho")
+                FatalErrorInFunction << pw << ": totalPressure on p_rgh: only the default U, phi, rho and psi none"
+                    << " are supported" << exit(FatalError);
+            p0Field = scalarField("p0", pd_bc, Pp.size());
+        }
         else
             FatalErrorInFunction << pw << ": p_rgh boundary type " << pt << " is not supported" << exit(FatalError);
         const scalarField& pb = p.boundaryField()[pi];
@@ -505,6 +527,11 @@ void FluidCoupling::setup(FluidRegion& f)
             if (pk == gc::PK_FLUX) pGrad[sl] = refCast<const fixedGradientFvPatchScalarField>(Pp).gradient()[i];
             // createFluidFields: p_rgh = p - rho gh (fixed-value patches too)
             if (pk == gc::PK_FIXED) pVal[sl] = pb[i] - rhoB[sl]*((g.value() & Cf[i]) - ghRef);
+            else if (pk == gc::PK_TOTALP)
+            {
+                p0Val[sl] = p0Field[i];
+                pVal[sl] = pb[i] - rhoB[sl]*((g.value() & Cf[i]) - ghRef);
+            }
             else if (pk == gc::PK_PRGH_P || pk == gc::PK_PRGH_TOTALP)
             {
                 p0Val[sl] = p0Field[i];
@@ -1073,17 +1100,10 @@ void FluidCoupling::hvacControl(scalar t0, scalar dt)
     const label nBr = f.nBr;
     std::vector<double> phiB = E_.fget(f.id, gc::F::phiB, 0, nBr);
     std::vector<double> Tb_r = E_.get(gc::A::TbB, R.b0, nBr);
-    std::vector<double> Yc_v, Yb_v;
-    if (hvacVapIdx_ >= 0) E_.fgetSpecie(f.id, hvacVapIdx_, Yc_v, Yb_v);
-    const std::vector<double> pAbs = E_.fget(f.id, gc::F::pAbs);
-    std::vector<double> p_b(nBr, 0.0);
-    forAll(mesh.boundary(), pi)
-    {
-        if (R.patches[pi].kind != PatchMap::BOUNDARY) continue;
-        const label s0 = f.slot0[pi];
-        const labelUList& fc = mesh.boundary()[pi].faceCells();
-        forAll(fc, i) p_b[s0 + i] = pAbs[fc[i]];
-    }
+    // the controller reads the boundary slots only: water vapour there, p of the face cells
+    std::vector<double> Yb_v;
+    if (hvacVapIdx_ >= 0) Yb_v = E_.fgetSpecieSlots(f.id, hvacVapIdx_, 0, nBr);
+    std::vector<double> p_b = E_.fgetAtSlotCells(f.id, gc::F::pAbs, nBr);
     std::vector<double> Tc = E_.get(gc::A::T, R.c0, mesh.nCells());
 
     const bool hasW = energy_.hasBuilding();
@@ -1203,8 +1223,21 @@ void FluidCoupling::momentum(scalar dt, bool finalIter)
         if (f.momentumPredictor)
         {
             const char* c = "xyz";
+            vector r0(Zero), r1(Zero);
+            Vector<label> it(Zero);
+            bool conv = true;
             for (int k = 0; k < 3; ++k)
-                if (sd[k] > 0) logSolve(ctl.name, word(std::string("U") + c[k]), info[k]);
+            {
+                if (sd[k] <= 0) continue;
+                Info<< ctl.name.c_str() << ":  Solving for " << "U" << c[k] << ", Initial residual = "
+                    << info[k].res0 << ", Final residual = " << info[k].res << ", No Iterations " << info[k].iters
+                    << endl;
+                r0[k] = info[k].res0;
+                r1[k] = info[k].res;
+                it[k] = info[k].iters;
+                conv = conv && converged(ctl, info[k]);
+            }
+            mesh.data().setSolverPerformance("U", SolverPerformance<vector>(ctl.name, "U", r0, r1, it, conv));
         }
     }
 }
@@ -1228,7 +1261,7 @@ void FluidCoupling::species(scalar dt, bool finalIter)
         {
             if (m == fp.inertIndex) continue;
             f.lastRes[fp.species[m].name] = info[m].res0;
-            logSolve(ctl.name, fp.species[m].name, info[m]);
+            logSolve(mesh, ctl, fp.species[m].name, info[m]);
         }
     }
 }
@@ -1246,24 +1279,30 @@ void FluidCoupling::pressure(scalar dt, bool finalIter)
         if (f.frozenFlow) continue;
         const fvMesh& mesh = *R_[f.r].mesh;
         const scalar pRelax = relaxFactor(mesh, "p_rgh", finalIter, true);
+        // chtMultiRegionFoam stores p_rgh.prevIter() only when nOuterCorrectors != 1; p_rgh.relax() then fails
+        if (pRelax > 0 && nOuterCorr_ == 1)
+            FatalErrorInFunction << mesh.name() << ": p_rgh is relaxed (" << (finalIter ? "p_rghFinal" : "p_rgh")
+                << ") but with nOuterCorrectors 1 the previous iteration field is not stored"
+                << " (OpenFOAM: previous iteration field p_rgh not stored)" << exit(FatalError);
         for (label corr = 0; corr < f.nCorr; ++corr)
         {
             const bool fin = finalIter && corr == f.nCorr - 1;
             const gc::SolverCtl ctl = readSolver(mesh, fin ? "p_rghFinal" : "p_rgh", true);
             double cont[2] = {0, 0};
-            const gc::SolveInfo si = E_.fluidPressure(f.id, dt, ctl, pRelax, f.nNonOrth, cont);
+            const gc::SolveInfo si = E_.fluidPressure(f.id, dt, ctl, pRelax, f.nNonOrth, cont, corr > 0);
             if (corr == 0) f.lastRes["p_rgh"] = si.res0;
-            logSolve(ctl.name, "p_rgh", si);
+            logSolve(mesh, ctl, "p_rgh", si);
             f.cumulativeContErr += cont[1];
             Info<< "time step continuity errors (" << mesh.name() << ") : sum local = " << cont[0]
                 << ", global = " << cont[1] << ", cumulative = " << f.cumulativeContErr << endl;
         }
         // solveFluid.H: rho = thermo.rho()
         E_.fluidUpdateRho(f.id);
-        const std::vector<double> r = E_.fget(f.id, gc::F::rho);
-        double mn = 1e300, mx = -1e300;
-        for (const double v : r) { mn = std::min(mn, v); mx = std::max(mx, v); }
-        Info<< "Min/max rho:" << mn << ' ' << mx << endl;
+        // min(rho) / max(rho) of the GeometricField: cells and patch faces
+        double mn = 1e300, mx = -1e300, mnB = 1e300, mxB = -1e300;
+        E_.fminMax(f.id, gc::F::rho, mn, mx);
+        E_.fminMax(f.id, gc::F::rhoB, mnB, mxB);
+        Info<< "Min/max rho:" << std::min(mn, mnB) << ' ' << std::max(mx, mxB) << endl;
     }
 }
 
@@ -1276,14 +1315,14 @@ void FluidCoupling::turbulence(scalar dt, bool finalIter)
         const fvMesh& mesh = *R_[f.r].mesh;
         const scalar alphaK = relaxFactor(mesh, "k", finalIter, false);
         const scalar alphaEps = relaxFactor(mesh, "epsilon", finalIter, false);
-        const gc::SolverCtl ctlK = readSolver(mesh, finalIter ? "kFinal" : "k", false, true);
-        const gc::SolverCtl ctlEps = readSolver(mesh, finalIter ? "epsilonFinal" : "epsilon", false, true);
+        const gc::SolverCtl ctlK = readSolver(mesh, finalIter ? "kFinal" : "k", false);
+        const gc::SolverCtl ctlEps = readSolver(mesh, finalIter ? "epsilonFinal" : "epsilon", false);
         gc::SolveInfo infoEps, infoK;
         E_.fluidTurbulence(f.id, dt, alphaK, alphaEps, ctlK, ctlEps, infoEps, infoK);
         f.lastRes["epsilon"] = infoEps.res0;
         f.lastRes["k"] = infoK.res0;
-        logSolve(ctlEps.name, "epsilon", infoEps);
-        logSolve(ctlK.name, "k", infoK);
+        logSolve(mesh, ctlEps, "epsilon", infoEps);
+        logSolve(mesh, ctlK, "k", infoK);
     }
 }
 
@@ -1396,7 +1435,8 @@ void FluidCoupling::writeBack()
                 forAll(pr, k) pr[k] = pc[fc[k]];
                 pp == pr;
             }
-            else if (pt == "fixedValue" || pt == "uniformFixedValue" || pt == "prghPressure" || pt == "prghTotalPressure")
+            else if (pt == "fixedValue" || pt == "uniformFixedValue" || pt == "prghPressure" || pt == "prghTotalPressure"
+                  || pt == "totalPressure")
             {
                 forAll(pr, k) pr[k] = pV[s0 + k];
                 pp == pr;

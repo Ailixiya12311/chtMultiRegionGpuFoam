@@ -1,6 +1,10 @@
-/* GCOF: project root (gpu_cht_of_r1), GCOF_BIN: build/omp or build/cuda (libgpucht.so and the executable) */
+/* libgpucht.so and the solver go to OpenFOAM's user directories unless GPUCHT_LIBBIN / GPUCHT_APPBIN say
+   otherwise (Allwmake; tools/build_app.sh puts both in build/<backend> for the verification scripts) */
+GPUCHT_LIBBIN ?= $(FOAM_USER_LIBBIN)
+GPUCHT_APPBIN ?= $(FOAM_USER_APPBIN)
+
 EXE_INC = \
-    -I$(GCOF)/lib \
+    -I../../lib \
     -I$(LIB_SRC)/finiteVolume/lnInclude \
     -I$(LIB_SRC)/meshTools/lnInclude \
     -I$(LIB_SRC)/regionModels/regionModel/lnInclude
@@ -21,4 +25,4 @@ EXE_LIBS = \
     -lradiationModels \
     -lregionModels \
     -ldl \
-    -L$(GCOF_BIN) -lgpucht -Wl,-rpath,'$$ORIGIN' -Wl,-rpath,$(GCOF_BIN)
+    -L$(GPUCHT_LIBBIN) -lgpucht -Wl,-rpath,'$$ORIGIN' -Wl,-rpath,$(GPUCHT_LIBBIN)

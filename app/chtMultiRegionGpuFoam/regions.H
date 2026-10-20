@@ -14,6 +14,7 @@
 #include "fvMesh.H"
 #include "volFields.H"
 #include "surfaceFields.H"
+#include "SolverPerformance.H"
 #include "api.h"
 
 namespace Foam
@@ -43,6 +44,13 @@ struct Region
 
 // fills mi and the patch maps of every region
 void buildGlobalMesh(List<Region>& regions, gc::MeshIn& mi);
+
+// SolverPerformance::checkConvergence for a device solve
+inline bool converged(const gc::SolverCtl& ctl, const gc::SolveInfo& si)
+{
+    return si.iters >= ctl.minIter
+        && (si.res < ctl.tol || (ctl.relTol > 0 && si.res < ctl.relTol*si.res0));
+}
 
 } // namespace gpuCht
 } // namespace Foam

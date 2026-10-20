@@ -14,7 +14,7 @@ namespace gc
 // U slot kinds: U_b = a + b U_P per component
 enum UKind { U_FIXED = 0, U_ZEROGRAD = 1, U_INLETOUTLET = 2, U_PIOV = 3, U_SLIP = 4 };
 // p_rgh slot kinds
-enum PKind { P_FIXED = 0, P_ZEROGRAD = 1, P_FLUX = 2, P_PRGH_P = 3, P_PRGH_TOTALP = 4 };
+enum PKind { P_FIXED = 0, P_ZEROGRAD = 1, P_FLUX = 2, P_PRGH_P = 3, P_PRGH_TOTALP = 4, P_TOTALP = 5 };
 
 struct Flow
 {
@@ -65,6 +65,7 @@ struct Flow
     dvec<double> src3, bD3, bS3, bMin;        // UEqn: sources, boundary diagonal / source per component
     dvec<double> rAU, HbyA, HbyAB;
     dvec<double> rhorAUf, rhorAUfB, phiHbyA, phiHbyAB, phig, phigB, pCorr;
+    dvec<double> wS;                          // slot scratch (p_rgh slot values for its gradient)
     Ldu MU, Mp;
     AmgCache amgP;
     bool haveUEqn = false;
@@ -116,8 +117,9 @@ struct Flow
     void storeOld(double dt, bool frozen, bool storePrevIter);
     void momentum(double dt, double alpha, const SolverCtl& ctl, bool predictor, SolveInfo info[3]);
     void species(double dt, const std::vector<double>& alphaY, const SolverCtl& ctl, std::vector<SolveInfo>& info);
+    // sameRho: T (so rho) unchanged since the previous call (the next corrector), grad(rho) is kept
     void pressure(double dt, const SolverCtl& ctl, double pRelax, int nNonOrth, SolveInfo& info,
-                  double contErr[2]);
+                  double contErr[2], bool sameRho = false);
     void turbulence(double dt, double alphaK, double alphaEps, const SolverCtl& ctlK, const SolverCtl& ctlEps,
                     SolveInfo& infoEps, SolveInfo& infoK);
     void updateRho();                          // rho = thermo rho(T)

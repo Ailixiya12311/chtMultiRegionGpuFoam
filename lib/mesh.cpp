@@ -83,6 +83,20 @@ void DMesh::build(const MeshIn& m)
     for (int c = 0; c < nC; ++c)
         if (reg[c] < 0) fatal("MeshIn: cell %d belongs to no region", c);
     cellRegion = to_dev(reg);
+    work.resize(nWork);
+}
+
+double* DMesh::workBuf(int slot, long n) const
+{
+    if (slot < 0 || slot >= int(work.size())) fatal("DMesh: work slot %d out of range", slot);
+    dvec<double>& w = work[slot];
+    if (long(w.size()) < n)
+    {
+        w.clear();
+        w.shrink_to_fit();
+        w.resize(n);
+    }
+    return ptr(w);
 }
 
 MeshView view(const DMesh& m)

@@ -2,6 +2,10 @@
 // gather-type kernels (deterministic sums, no atomics).
 #pragma once
 
+#include <array>
+#include <memory>
+#include <utility>
+
 #include "par.h"
 #include "vec.h"
 #include "api.h"
@@ -30,7 +34,16 @@ struct DMesh
     std::vector<MeshIn::Patch> patches;
     std::vector<MeshIn::Pair> pairs;
 
+    // linear-solver work vectors, kept between solves so that a solve allocates no device memory; a slot only
+    // grows (contents are not kept across solves)
+    static constexpr int nWork = 12;
+    mutable std::vector<dvec<double>> work;
+    // per linear system {c0, nc, f0, nf}: its multi-colour ordering (linsolve.cpp), built on first use; kept here
+    // so that it is freed with the mesh, before the device goes away
+    mutable std::vector<std::pair<std::array<long, 4>, std::shared_ptr<void>>> colourings;
+
     void build(const MeshIn& m);
+    double* workBuf(int slot, long n) const;
 };
 
 // raw-pointer view for kernels

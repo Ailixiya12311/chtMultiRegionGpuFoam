@@ -1,0 +1,5 @@
+#!/bin/sh
+cd "${0%/*}" || exit 1
+wclean app/chtMultiRegionGpuFoam
+make -C lib BACKEND=omp clean
+make -C lib BACKEND=cuda clean

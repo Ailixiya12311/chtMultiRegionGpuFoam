@@ -191,6 +191,7 @@ void Energy::init(const DMesh& mesh, int nRegions)
     fill(kappaWall, -1.0);
     phi.resize(nF);
     fill(phi, 0.0);
+    fS.resize(m->nIr);
     M.init(0, int(nC), 0, m->nI, m->nIr);
 }
 
@@ -257,6 +258,7 @@ void Energy::boundaryState()
 
 void Energy::gradient()
 {
+    ProfScope prof("gradient");
     EV v = ev(*this);
     const MeshView g = v.g;
     for_n(g.nC, [=] HD (long c) { v.h[c] = v.cp[c]*v.T[c] + v.e[c]; });
@@ -317,17 +319,23 @@ void Energy::assemble(double dt)
     EV v = ev(*this);
     const MeshView g = v.g;
     LduView L = view(M);
-    // off-diagonal coefficients
+    // off-diagonal coefficients, and the explicit part per face: faceTerms gives dO = -lo, dN = -up, sN = -sO
+    // exactly (each pair is built with mirrored operations), so the cell rows below need only up, lo and sO
+    std::unique_ptr<ProfScope> pf(new ProfScope("faces"));
+    double* fs = ptr(fS);
     for_n(g.nIr, [=] HD (long f) {
         const FaceTerms t = faceTerms(v, f);
         L.upper[f] = t.up;
         L.lower[f] = t.lo;
+        fs[f] = t.sO;
     });
     for_n(g.nIface, [=] HD (long j) {
         L.upper[g.nIr + j] = -v.G[j];
         L.lower[g.nIr + j] = -v.G[j];
     });
     // cell rows: interior diagonal / source, boundary(-like) parts
+    pf.reset();
+    ProfScope pc("cells");
     const double rdt = dt > 0 ? 1.0/dt : 0.0;
     for_n(g.nC, [=] HD (long c) {
         double D = 0, S = 0, bD = 0, bA = 0, bS = 0, divPhi = 0;
@@ -336,17 +344,15 @@ void Energy::assemble(double dt)
             const int ent = g.cfEnt[k];
             if (ent >= 0 && ent < g.nIr)
             {
-                const FaceTerms t = faceTerms(v, ent);
-                D += t.dO;
-                S += t.sO;
+                D += -L.lower[ent];
+                S += fs[ent];
                 divPhi += v.phi[ent];
             }
             else if (ent < 0 && -ent - 1 < g.nIr)
             {
                 const int f = -ent - 1;
-                const FaceTerms t = faceTerms(v, f);
-                D += t.dN;
-                S += t.sN;
+                D += -L.upper[f];
+                S += -fs[f];
                 divPhi -= v.phi[f];
             }
             else if (ent >= 0 && ent < g.nI)  // interface, side A
@@ -405,14 +411,19 @@ void Energy::assemble(double dt)
 
 SolveInfo Energy::solve(double dt, const SolverCtl& ctl, bool relaxOn)
 {
-    boundaryState();
-    gradient();
-    assemble(dt);
+    ProfScope prof("energy");
+    {
+        ProfScope pa("assemble");
+        { ProfScope pb("boundaryState"); boundaryState(); }
+        gradient();
+        assemble(dt);
+    }
     EV v = ev(*this);
     const MeshView g = v.g;
     LduView L = view(M);
     if (relaxOn)
     {
+        ProfScope pr("relax");
         // fvMatrix::relax on the he matrix of each region, carried out in T: the T matrix is the he matrix with
         // column j scaled by cp_j, so off-diagonal magnitudes and patch coefficients are divided back by cp
         double* T = ptr(this->T);

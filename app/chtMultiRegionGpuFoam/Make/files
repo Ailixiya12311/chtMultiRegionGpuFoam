@@ -3,4 +3,4 @@ energyCoupling.C
 fluidCoupling.C
 chtMultiRegionGpuFoam.C
 
-EXE = $(GCOF_BIN)/chtMultiRegionGpuFoam
+EXE = $(GPUCHT_APPBIN)/chtMultiRegionGpuFoam

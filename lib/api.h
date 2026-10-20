@@ -61,7 +61,11 @@ struct MeshIn
 struct SolverCtl
 {
     enum Method { PCG, PBICGSTAB, SMOOTH } method = PBICGSTAB;
-    enum Precond { NONE, JACOBI, AMG } precond = JACOBI;
+    enum Precond { NONE, JACOBI, AMG, DILU } precond = JACOBI;
+    // SMOOTH (smoothSolver): GS Gauss-Seidel, SYMGS forward + backward sweep, DILUSM x += DILU^-1 (b - A x);
+    // nSweeps sweeps between residual checks
+    enum Smoother { GS, SYMGS, DILUSM } smoother = GS;
+    int nSweeps = 1;
     double tol = 1e-6, relTol = 0.0;
     int maxIter = 1000, minIter = 0;
     std::string name;                         // for the log (OpenFOAM-style solver name)
@@ -163,7 +167,7 @@ enum class F
     phi                                                         // region internal faces
 };
 enum UKindIn { UK_FIXED = 0, UK_ZEROGRAD = 1, UK_INLETOUTLET = 2, UK_PIOV = 3, UK_SLIP = 4 };
-enum PKindIn { PK_FIXED = 0, PK_ZEROGRAD = 1, PK_FLUX = 2, PK_PRGH_P = 3, PK_PRGH_TOTALP = 4 };
+enum PKindIn { PK_FIXED = 0, PK_ZEROGRAD = 1, PK_FLUX = 2, PK_PRGH_P = 3, PK_PRGH_TOTALP = 4, PK_TOTALP = 5 };
 
 struct FlowPatchIn
 {
@@ -235,7 +239,18 @@ public:
                         std::vector<double>& gA, std::vector<double>& gB) const;
 
     void energyBoundaryState();               // refresh boundary / interface T after a change of T
+    // per region min / max of T over its cells and patch faces (boundary faces, its side of the interfaces), as
+    // OpenFOAM's min(T) / max(T) of the GeometricField; the boundary state as the last solve left it
+    void energyMinMaxT(std::vector<double>& mn, std::vector<double>& mx) const;
     void setEnergyConvection(int conv, double k, bool bounded);   // 0 upwind 1 linearUpwind 2 linear 3 limitedLinear
+
+    // ---- fvOptions scalarSemiImplicitSource evaluated on the device. Source k adds su_k w_ki to Su and sp_k w_ki
+    // to Sp of its cells c_ki (summed over the sources in order k, as the host loop did). sourceSet, once: the cell
+    // lists (global cells for the energy, fluidId < 0; cells of fluid fluidId for its specie sp) and weights; the
+    // other cells keep Su = Sp = 0. sourceValues, at every update: su_k, sp_k of all sources of the set.
+    int sourceSet(int fluidId, int sp, const std::vector<std::vector<int>>& cells,
+                  const std::vector<std::vector<double>>& w);
+    void sourceValues(int set, const std::vector<double>& su, const std::vector<double>& sp);
 
     // ---- building physics
     void buildingInit(const BuildingIn& bi, int& nGlaze, int& nGlazeMiss, double& areaExt, double& areaGlaze);
@@ -247,6 +262,9 @@ public:
     int nSlots(int id) const;
     void fput(int id, F a, const std::vector<double>& v, long offset = 0);
     std::vector<double> fget(int id, F a, long offset = 0, long n = -1) const;
+    void fminMax(int id, F a, double& mn, double& mx) const;   // over the whole array
+    // cell array a at the cells of slots [0, n) (a[sCell[s]])
+    std::vector<double> fgetAtSlotCells(int id, F a, long n) const;
     void fputKinds(int id, const std::vector<int>& uKind, const std::vector<int>& pKind,
                    const std::vector<char>& uAssign, const std::vector<char>& uFixes);
     void fputFlowPatches(int id, const std::vector<FlowPatchIn>& fp);
@@ -256,6 +274,7 @@ public:
     void fputSpecieVal(int id, int sp, const std::vector<double>& val, long offset = 0);
     void fputSpecieSource(int id, int sp, const std::vector<double>& Su, const std::vector<double>& Sp);
     void fgetSpecie(int id, int sp, std::vector<double>& Y, std::vector<double>& Yb) const;
+    std::vector<double> fgetSpecieSlots(int id, int sp, long offset, long n) const;
     void fluidUpdateMixture(int id);
     void fputTurb(int id, const std::vector<double>& k, const std::vector<double>& eps,
                   const std::vector<double>& nut, const std::vector<double>& alphat,
@@ -273,7 +292,10 @@ public:
     void fluidMomentum(int id, double dt, double alphaU, const SolverCtl& ctl, bool predictor, SolveInfo info[3]);
     void fluidSpecies(int id, double dt, const std::vector<double>& alphaY, const SolverCtl& ctl,
                       std::vector<SolveInfo>& info);
-    SolveInfo fluidPressure(int id, double dt, const SolverCtl& ctl, double pRelax, int nNonOrth, double contErr[2]);
+    // sameRho: the temperature has not changed since the previous call (a further corrector of the same outer
+    // iteration), so rho and grad(rho) are those of that call
+    SolveInfo fluidPressure(int id, double dt, const SolverCtl& ctl, double pRelax, int nNonOrth, double contErr[2],
+                            bool sameRho = false);
     void fluidTurbulence(int id, double dt, double alphaK, double alphaEps, const SolverCtl& ctlK,
                          const SolverCtl& ctlEps, SolveInfo& infoEps, SolveInfo& infoK);
     void fluidUpdateRho(int id);
@@ -285,6 +307,8 @@ public:
     double fluidCourantNo(int id, double dt, double& meanCo) const;
 
     double memGB() const;
+    void sync() const;                        // wait for the device (phase timing)
+    std::string profReport() const;           // GPUCHT_PROF=1: wall time per library scope (else empty)
 
 private:
     struct Impl;

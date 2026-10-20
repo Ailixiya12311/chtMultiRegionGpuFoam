@@ -1,0 +1,32 @@
+#!/bin/sh
+# Build and install chtMultiRegionGpuFoam like any OpenFOAM application (source OpenFOAM v2606's etc/bashrc first):
+#   ./Allwmake                 CUDA build for the GPU of this machine (nvcc on PATH)
+#   ARCH=sm_89 ./Allwmake      CUDA build for another GPU; ARCH=all: sm_80 ... sm_120 in one library
+#   ./Allwmake -omp            CPU build (OpenMP threads, no CUDA needed)
+# Installs libgpucht.so to $FOAM_USER_LIBBIN and chtMultiRegionGpuFoam to $FOAM_USER_APPBIN, both on the
+# OpenFOAM paths, so the solver then runs as  chtMultiRegionGpuFoam -case <case>.
+cd "${0%/*}" || exit 1
+set -e
+
+[ -n "$FOAM_USER_APPBIN" ] && [ -n "$FOAM_USER_LIBBIN" ] || { echo "Allwmake: source OpenFOAM's etc/bashrc first" >&2; exit 1; }
+
+B=cuda
+[ "$1" = "-omp" ] && B=omp
+if [ $B = cuda ] && ! command -v nvcc >/dev/null 2>&1; then
+    echo "Allwmake: nvcc not found (add the CUDA toolkit's bin to PATH, or ./Allwmake -omp for the CPU build)" >&2
+    exit 1
+fi
+
+# Thrust / libcu++ / CUB headers for the OpenMP build (the CUDA build uses the toolkit's own)
+if [ $B = omp ] && [ ! -d third_party/cccl-3.0.3 ]; then
+    (cd third_party && sha256sum -c SHA256SUMS && tar xzf cccl-3.0.3.tar.gz)
+fi
+
+make -C lib BACKEND=$B ARCH=${ARCH:-native} -j${WM_NCOMPPROCS:-4}
+mkdir -p "$FOAM_USER_LIBBIN" "$FOAM_USER_APPBIN"
+cp build/$B/libgpucht.so "$FOAM_USER_LIBBIN"/
+
+export GPUCHT_LIBBIN="$FOAM_USER_LIBBIN" GPUCHT_APPBIN="$FOAM_USER_APPBIN"
+wmake app/chtMultiRegionGpuFoam
+
+echo "Allwmake: installed $FOAM_USER_APPBIN/chtMultiRegionGpuFoam ($B) and $FOAM_USER_LIBBIN/libgpucht.so"

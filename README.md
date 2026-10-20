@@ -4,13 +4,16 @@
 
 **M0～M7 全部完成并通过双后端（`BACKEND=omp` 与 NAS 直通 RTX 3080 `BACKEND=cuda ARCH=sm_86`）对照验证。**
 
+> 10-20 注：第 1～4 节是 10-19 用 Gemini 做的版本写的；10-20 Claude 接手后按代码逐条核对过，写错的地方已在原处更正并注明。10-20 的改动、重跑结果、测速和下一步见第 5、6 节。
+
 ## 1. 结构
 
 ```
 gpu_cht_of_r1/
+  Allwmake / Allwclean              标准安装（装进 $FOAM_USER_LIBBIN / $FOAM_USER_APPBIN）与清理，见第 5 节
   lib/                              计算库 libgpucht.so，不含 OpenFOAM 头文件；同一份 C++17 源码两种编法：
                                       make BACKEND=omp                g++ -fopenmp（Thrust OMP 后端）
-                                      make BACKEND=cuda ARCH=sm_86    nvcc（RTX 3080 / A100 sm_80 / G4 sm_89 等）
+                                      make BACKEND=cuda ARCH=sm_86    nvcc（RTX 3080 sm_86 / A100 sm_80 / G4 sm_120 等）
     par.h                           后端层：dvec（thrust::device_vector）、for_n / sum_n / max_n / min_n、HD 宏
     vec.h                           三维向量/对称张量工具（核函数内联）
     api.h                           OpenFOAM 程序与计算库接口（仅标准 C++ 类型）：MeshIn、SolverCtl、Engine
@@ -18,10 +21,10 @@ gpu_cht_of_r1/
     ldu.h / ldu.cpp                 LDU 矩阵：Amul、sumA、relax（v2606 fvMatrix::relax）、setValues
     linsolve.h / linsolve.cpp       柔性 PCG、PBiCGStab、Jacobi 光滑、聚合 AMG（最细层直接 LDU，粗层 CSR）
     energy.h / energy.cpp           全区单矩阵共轭能量方程（T 形式解 he 方程，耦合界面串联导热 + 接触热阻层）
-    flow.h / flow.cpp               流体区 PIMPLE：动量 UEqn、压力 pEqn（p_rgh）、多组分 YEqn、RNG/realizable k-ε + 壁面函数
+    flow.h / flow.cpp               流体区 PIMPLE：动量 UEqn、压力 pEqn（p_rgh）、多组分 YEqn、RNG k-ε + 壁面函数
     building.h / building.cpp       建筑物理：气象插值、太阳位置与正交阴影图光追（ShadowMap）、室外/室内长短波辐射分配
     engine.cpp                      Engine 实现（设备数组管理与各物理模块调度）
-    core.cpp                        sync / 显存查询（cudaMemGetInfo / VmRSS）/ fatal
+    core.cpp                        sync / 显存查询（cudaMemGetInfo / VmRSS）/ 分段计时 ProfScope（GPUCHT_PROF）/ fatal
     Makefile
   app/chtMultiRegionGpuFoam/        OpenFOAM v2606 主程序（wmake 编译）
     chtMultiRegionGpuFoam.C         主循环（含 adjustTimeStep：maxCo / maxDi / maxDeltaT，与 v2606 逐行一致）
@@ -33,11 +36,16 @@ gpu_cht_of_r1/
     Make/files, Make/options
   test/test_lib.cpp                 不依赖 OpenFOAM 的库级自检（双材料棒解析解、48³ 立方体 AMG、ShadowMap 太阳光追自检）
   tools/
-    nas.sh                          同步源码到 NAS 并在隔离容器（支持 --gpus all 直通 RTX 3080）内执行命令
+    nas.sh                          同步源码到 NAS 并在隔离容器（支持 --gpus all 直通 RTX 3080）内执行命令；
+                                    主机/密钥/目录读不入库的 tools/nas.env（样例 nas.env.example）
     build_app.sh                    一键编译 libgpucht.so、test_lib 与 chtMultiRegionGpuFoam（BACKEND=omp|cuda）
   verify/
     compare_of.py                   OpenFOAM 场对场最大误差 / 均方根误差对比脚本
     m1.sh ~ m7.sh                   M1～M7 分级验证脚本
+    m8.sh                           functionObjects（probes、fieldMinMax、volFieldValue、solverInfo）与 OpenFOAM 对照
+    bench_case.sh / bench_run.sh    三维湍流测速算例生成；同算例 GPU 与 OpenFOAM（mpirun）计时和场对比
+    diag_spike.py                   两个结果差得最大的单元（坐标、两边值、所在补丁）
+    cmp_old_new.sh                  10-20 回归：重跑结果与 cases_before_20261020/ 备份逐场对比
 ```
 
 NAS 环境：主机、密钥、工作目录和镜像名写在 `tools/nas.env`（不入库，照 `tools/nas.env.example` 填），工作目录下的 `gpu_cht_of_r1` 在容器内挂载为 `/w`，Py 版只读挂载为 `/py`。容器镜像（OpenFOAM v2606 + g++ 13.3 + CUDA 12.8 挂载于 `/usr/local/cuda`），NAS 显卡 **NVIDIA GeForce RTX 3080 (20 GB VRAM, `sm_86`, Driver 580.142)** 通过 `--gpus all` 直通容器。
@@ -52,7 +60,7 @@ NAS 环境：主机、密钥、工作目录和镜像名写在 `tools/nas.env`（
   3. 动量 `UEqn.relax()` 对向量场将各分量边界系数最大值并入 `bAbs`、最小值并入 `bMin`。
   4. `pEqn.H` 中 `corr == 0` 查 `"p_rgh"`，仅当 `finalIter && corr == nCorr - 1` 时查 `"p_rghFinal"`；`p_rgh.storePrevIter()` 每时间步开头存一次；重启时 `fixedFluxPressure` 保留初始文件里的 `gradient()`。
   5. `YEqn.H` 多变量对流 `div(phi,Yi_h)` 同时限制所有组分 `Y_m` 与比焓 `he` 的最小面通量限制器权重，方程求解后立即更新混合物热物性 `thermo.correct()`（`Cp, e, kappa, mu, rho0, T0, beta`）。
-  6. 湍流 `realizableKE` / `RNGkEpsilon`：壁面单元包含在耦合界面补丁（`IFACE_A`/`IFACE_B`）上的流体槽；`epsilonWallFunction` 按补丁自身 `Cmu, kappa, E` 计算 `yPlusLam` 并按面积加权壁面单元 `G` 与 `epsilon`（`setValues` 强加）；求解后执行 `bound(k, kMin)` 与 `bound(epsilon, epsMin)` 的邻域面加权回退。
+  6. 湍流 `RNGkEpsilon`（代码只认这一种，其他 RAS 模型直接报错；此处原写有 realizableKE，与代码不符，10-20 更正）：壁面单元包含在耦合界面补丁（`IFACE_A`/`IFACE_B`）上的流体槽；`epsilonWallFunction` 按补丁自身 `Cmu, kappa, E` 计算 `yPlusLam` 并按面积加权壁面单元 `G` 与 `epsilon`（`setValues` 强加）；求解后执行 `bound(k, kMin)` 与 `bound(epsilon, epsMin)` 的邻域面加权回退。
   7. 自适应时间步 `adjustTimeStep`：流体 Courant 数 `0.5 * sumSurface(|phi|) / rho / V * dt` 与固体扩散数 `max(sqr(deltaCoeffs) * kappa/(rho*Cp)) * dt` 及其阻尼增长公式 `min(min(maxDeltaTFluid, 1.0 + 0.1*maxDeltaTFluid), 1.2)` 与 OpenFOAM v2606 完全一致。
 
 ## 3. M0～M7 验证结果汇总（OMP 与 CUDA 双后端全部通过）
@@ -63,12 +71,14 @@ NAS 环境：主机、密钥、工作目录和镜像名写在 `tools/nas.env`（
 | **M1** | `verify/m1.sh` | 斜六面体非正交双固体区锯齿界面、时变固定值 + `externalWallHeatFluxTemperature`（含辐射） | 对照 OpenFOAM v2606 `chtMultiRegionFoam`（10 步到 `t=50 s`）：两固体区 `T` 最大差 **`1.14e-11 K`**（达写出精度上限） |
 | **M2** | `verify/m2.sh` | V5 共轭方腔（空气 Boussinesq + 4 固体壁面，4000 步稳态起热面阶跃 +5 K，30 步 × 15 外迭代） | 对照 `chtMultiRegionFoam`：首步动量初始残差对到 **12 位有效数字**；`t=60 s` 时 `air/T` 最大差 `4.10e-5 K`（量程 5 K），`air/U` 最大差 `4.9e-7 m/s`，固体 `T` 差 `≤ 1.8e-5 K` |
 | **M3** | `verify/m3.sh` | 湿空气双组分（`dryAir + waterVapour`）+ 温度梯度腔体（含多变量 `limitedLinear`、物性随组分变化） | 对照 `chtMultiRegionFoam`：`air/waterVapour` 最大差 **`4.36e-9`**，`air/T` 最大差 `4.64e-6 K`，`air/U` 最大差 `1.69e-8 m/s`，`solid/T` 差 `3.05e-7 K` |
-| **M4** | `verify/m4.sh` | V5 湍流共轭方腔（`realizableKE` + `kqRWallFunction` / `epsilonWallFunction` / `nutkWallFunction` / `alphatJayatillekeWallFunction`） | 对照 `chtMultiRegionFoam`：`air/T` 最大差 **`2.72e-6 K`**，`air/U` `1.88e-7 m/s`，`air/k` `1.54e-8`，`air/epsilon` `1.12e-8`，`air/nut` `2.05e-8`，四固体区 `T` 差 `≤ 6.2e-7 K` |
+| **M4** | `verify/m4.sh` | V5 湍流共轭方腔（`RNGkEpsilon` + `kqRWallFunction` / `epsilonWallFunction` / `nutkWallFunction` / `alphatJayatillekeWallFunction`） | 对照 `chtMultiRegionFoam`：`air/T` 最大差 **`2.72e-6 K`**，`air/U` `1.88e-7 m/s`，`air/k` `1.54e-8`，`air/epsilon` `1.12e-8`，`air/nut` `2.05e-8`，四固体区 `T` 差 `≤ 6.2e-7 K` |
 | **M5** | `verify/m5.sh` | 全楼边界族与 `fvOptions`：Part 1 含 `flowRateInlet/Outlet`、`pressureInletOutletVelocity`、`prghTotalPressure`、`scalarSemiImplicitSource`（`h` 与 `waterVapour`）、`fixedTemperatureConstraint`；Part 2 为 `v7_small` 真实切块（7 区 28,284 单元） | 对照 `chtMultiRegionFoam`：Part 1 `air/T` 最大差 **`9.99e-7 K`**，`air/waterVapour` `3.79e-11`；Part 2 `v7_small` `air/T` rms `4.46e-4 K`，6 个固体区 `T` 最大差 `5.4e-7 ~ 4.4e-5 K`，`waterVapour` 最大差 `2.83e-8` |
 | **M6** | `verify/m6.sh` | Part 1：V5 共轭方腔开启 `adjustTimeStep` 对照 `chtMultiRegionFoam`；Part 2：`v7_full`（7 区 359,854 单元）开启 `gpuCht::exteriorSurface`、气象、太阳 ShadowMap、室内长波与 HVAC 闭环控制器对照 Py 版 | Part 1：`CoNum`/`DiNum` 与 `deltaT` 序列（`1.66666666667`×4, `2.5`×2）与 OpenFOAM **逐位一致**，`air/T` 差 `4.10e-5 K`；Part 2：`glazing_5mm/T` 差 **`1.60e-9 K`**，其余 5 固体区 `T` 差 `3.5e-6 ~ 2.1e-5 K`，`hvac.json` 盘管冷量相对差 `< 6e-7` |
 | **M7** | `verify/m7.sh` | CUDA (`sm_86`) vs OMP 一致性与加速比测试（`v7_full` 35.99 万单元）+ 全楼 `r3d_mr`（45 区 **42,454,693 单元**）精确显存预算验证 | `v7_full` 上 CUDA 仅用 **0.760 GB** 显存、耗时 **1.29 s**（比 Py 版快 **7.0×**，比 6 线程 OMP 快 **6.0×**），CUDA 与 OMP 固体 `T` 差 `≤ 3.4e-13 K`；全楼 `r3d_mr` 峰值显存 **61.55 GB (57.32 GiB)**，低于 96 GB 预算 **34.45 GB** |
 
 ## 4. 全楼算例 `r3d_mr`（45 区，4,245 万单元）显存预算明细
+
+> **10-20 注：本节是估算，不是实测。** `verify/m7.sh` 第 3 部分用手写公式按数组个数乘单元/面数算出，其中空气区面数 `nf_air_r3d = 69650000`、边界槽数 `nS_air_r3d = 11200000` 和线性求解器工作区系数都是填进去的估计值，全楼从未在 96 GB 卡上实际跑过。以实测为准。
 
 通过 `v7_full` 实测 `engine.memGB()` 标定并逐数组核对 `libgpucht.so` 中所有 `dvec` 分配，全楼模型（`nC = 42,454,693`，其中 `air` 区 `nc = 22,723,989` 单元、内部面 `nI = 130,948,546`、区间耦合面 `nIface = 11,781,318`、边界面 `nB = 2,199,607`）的 GPU 显存占用如下：
 
@@ -84,23 +94,217 @@ NAS 环境：主机、密钥、工作目录和镜像名写在 `tools/nas.env`（
 
 > 相比之下，Python/CuPy 版由于 `cupy` 内存池碎片及每次算子表达式产生临时数组，在全楼网格上需 `94.1 GiB` 而触发 OOM；C++ 版 `chtMultiRegionGpuFoam` 全部采用固定预分配数组与无临时数组的 `thrust::for_each_n` / `transform_reduce` 核函数，峰值仅 **57.32 GiB（61.55 GB）**，在 96 GB 显卡（如 RTX PRO 6000 / G4 或 A100 80GB）上留有 **> 34 GB** 的充足余量。
 
-## 5. 编译与运行命令
+## 5. 安装与使用（作为 OpenFOAM 求解器，10-20 起）
 
-1. **在 NAS 容器内一键编译（OMP 或 CUDA）**：
-   ```bash
-   # 编译 OpenMP 后端
-   ./tools/nas.sh 'BACKEND=omp bash /w/tools/build_app.sh'
+### 5.1 安装
 
-   # 编译 CUDA 后端（NAS RTX 3080 为 sm_86；Colab A100 设为 sm_80，L4/G4 设为 sm_89）
-   ./tools/nas.sh 'BACKEND=cuda ARCH=sm_86 bash /w/tools/build_app.sh'
-   ```
-2. **运行全部验证套件（M1～M7）**：
-   ```bash
-   ./tools/nas.sh 'for m in m1 m2 m3 m4 m5 m6 m7; do BACKEND=cuda bash /w/verify/${m}.sh || exit 1; done'
-   ```
-3. **直接对任意 OpenFOAM 多区算例运行 `chtMultiRegionGpuFoam`**：
-   ```bash
-   source /usr/lib/openfoam/openfoam2606/etc/bashrc
-   export LD_LIBRARY_PATH=/w/build/cuda:$LD_LIBRARY_PATH
-   /w/build/cuda/chtMultiRegionGpuFoam -case /path/to/case
-   ```
+和普通 OpenFOAM 程序一样，先 `source` OpenFOAM v2606 的 `etc/bashrc`，然后在本目录下：
+
+```bash
+./Allwmake                 # CUDA 版，按本机显卡编译（nvcc 要在 PATH 里）
+ARCH=sm_120 ./Allwmake     # 给别的显卡编译：A100 sm_80，RTX 3080 sm_86，L4 sm_89，H100 sm_90，
+                           # RTX PRO 6000 / Colab G4（Blackwell）sm_120；ARCH=all 一次编进全部
+./Allwmake -omp            # CPU 版（OpenMP 多线程，不需要 CUDA）
+```
+
+`libgpucht.so` 装到 `$FOAM_USER_LIBBIN`，`chtMultiRegionGpuFoam` 装到 `$FOAM_USER_APPBIN`，都在 OpenFOAM 的路径上。`./Allwclean` 清理。
+
+### 5.2 运行
+
+算例就是标准的 `chtMultiRegionFoam` 多区算例（`constant/regionProperties`、各区 `polyMesh`、`0/<区>/`、`system/<区>/`），不用改：
+
+```bash
+chtMultiRegionGpuFoam -case <算例>          # 单卡；CUDA_VISIBLE_DEVICES 选卡
+chtMultiRegionGpuFoam -noFunctionObjects   # 其余 OpenFOAM 通用选项照常
+```
+
+结果写成标准时间目录，paraFoam / foamToVTK / postProcess 直接读。重启从时间目录接着算（`startFrom latestTime`）。
+
+### 5.3 和 OpenFOAM 一起用时的行为
+
+- **functionObjects**：场常驻显存。controlDict 里有 functionObjects 时，每个时间步结束都把场拷回 OpenFOAM（OpenFOAM 在下一步开头执行它们），probes、fieldMinMax、volFieldValue、surfaceFieldValue、sample、fieldAverage 等按场工作的都能用。没有 functionObjects 时只在写出时刻拷回。（10-20 前只在写出时刻拷回，functionObjects 每步看到的是旧场，见 M8。）
+- **残差**：各方程的初始/最终残差和迭代数写进 `mesh.data()`，和 OpenFOAM 自己的求解器一样，`solverInfo` 能记录。能量方程是全区一个矩阵，所以每个区报的 `h` 残差相同。
+- **日志**：`Solving for ...` 行格式同 OpenFOAM；每步开头和 OpenFOAM 一样打印各流体区库朗数、各固体区扩散数（10-20 前只在 adjustTimeStep 时打印）；`Min/max T`、`Min/max rho` 和 OpenFOAM 一样含边界面值（10-20 晚起；以前只统计单元，和 OpenFOAM 日志对不上）；第一步结束时打印显存占用；结束时打印各阶段（动量、组分、能量、压力、湍流、拷回、写出、functionObjects）的墙钟时间。
+- **nOuterCorrectors 1 时不能松弛 p_rgh**：OpenFOAM 这时不存 prevIter，给了 `p_rgh`/`p_rghFinal` 场松弛会报错；本求解器 10-20 前不报错、朝过期的 prevIter 松弛（结果悄悄错），现在同样报错。
+- **在运行中用不了的 functionObjects**：要 OpenFOAM 热物性或湍流模型对象的（`wallHeatFlux`、`yPlus`、`Qdot` 等），本求解器不构造这些对象，会报找不到。写出后用 `chtMultiRegionFoam -postProcess -func wallHeatFlux` 之类事后算。
+
+### 5.4 支持范围（按代码核对；不在表里的写法一律报错退出，不猜）
+
+| 类别 | 支持 |
+| --- | --- |
+| 区 | `regionProperties` 的 fluid / solid；流体-流体界面不支持；只能串行（不支持 `-parallel`、cyclic、processor 补丁） |
+| 时间 | 瞬态，`ddtSchemes` 只能 Euler；`adjustTimeStep`（maxCo / maxDi / maxDeltaT）；没有稳态版（chtMultiRegionSimpleFoam 对应物） |
+| 流体热物性 | `heRhoThermo`，`const` 输运，`hConst`，`sensibleEnthalpy`；`pureMixture` 或 `multiComponentMixture`；状态方程 `Boussinesq` / `rhoConst`（多组分 Boussinesq 要 `libs (boussinesqMixtureThermo)`） |
+| 湍流 | `laminar`（Stokes）、`RAS RNGkEpsilon`；壁面函数 `kqRWallFunction`、`epsilonWallFunction`（无 lowReCorrection）、`nutkWallFunction`、`alphatJayatillekeWallFunction` / `alphatWallFunction` |
+| 辐射 / 燃烧 | `none`（建筑用的太阳、长波辐射在 `gpuCht::exteriorSurface` 和 `constant/gpuChtProperties` 里） |
+| 格式 | grad：`leastSquares`、`cellLimited leastSquares k`；div：`[bounded] Gauss upwind / linearUpwind grad(x) / linear / limitedLinear k`（`div(phi,Yi_h)` 不能加 bounded：v2606 的多变量格式不认，10-20 起同样报错）；laplacian：`Gauss linear corrected / uncorrected / limited [corrected] ψ` |
+| 线性求解器 | 名字照写 OpenFOAM 的，实际映射到本库：p_rgh 一律 AMG 预条件 PCG（日志 `AMGPCG`；凡 AMG 预条件，包括下面的 GAMG，V 循环都用单精度，外面的 Krylov 迭代双精度，10-20 晚起）；`GAMG`（非压力）→ AMG 预条件 BiCGStab；`PCG`/`PPCG`/`PPCR` → PCG，`PBiCG`/`PBiCGStab` → BiCGStab，preconditioner 认 `GAMG`（AMG）、`DIC`/`FDIC`/`DILU`（多色 DILU）、`diagonal`、`none`；`smoothSolver` 认 smoother `GaussSeidel`/`nonBlockingGaussSeidel`/`symGaussSeidel`（多色 Gauss-Seidel）、`DIC`/`DILU`（x += DILU⁻¹(b − Ax)）和 `nSweeps`。其他名字报错（10-20 起；以前一律悄悄当 Jacobi）。**多色**：单元先着色（相邻单元不同色，GPU 上 Jones-Plassmann，结果确定，每个系统只做一次），DILU 分解、前代回代和 Gauss-Seidel 按颜色逐色做、同色并行（10-20 夜起整个求解在颜色行序里做，向量先重排、解完排回）；公式与 OpenFOAM 相同，只是单元次序是颜色序而不是编号序，所以迭代次数接近而不相同。收敛判据（tolerance / relTol / maxIter / minIter）、残差归一化、smoothSolver 每 nSweeps 查一次残差都和 OpenFOAM 相同 |
+| PIMPLE | nOuterCorrectors、nCorrectors、nNonOrthogonalCorrectors、momentumPredictor、frozenFlow、outerCorrectorResidualControl（relTol 只能 0）、pRefCell / pRefPoint；不支持 consistent（SIMPLEC） |
+| T 边界 | fixedValue / uniformFixedValue / timeVaryingMappedFixedValue，zeroGradient / symmetry(Plane)，fixedGradient，mixed，inletOutlet / uniformInletOutlet，externalWallHeatFluxTemperature（power / flux / coefficient，无 qr、无 thermalInertia），区间界面 turbulentTemperatureCoupledBaffleMixed / RadCoupledMixed（qr none，可带 thicknessLayers / kappaLayers），gpuCht::exteriorSurface |
+| U 边界 | noSlip、fixedValue、movingWallVelocity、uniformFixedValue、flowRateInletVelocity / flowRateOutletVelocity（无 extrapolateProfile）、zeroGradient、inletOutlet、pressureInletOutletVelocity（无 tangentialVelocity）、slip / symmetry(Plane)；区间界面上只能是壁面 |
+| p_rgh 边界 | fixedFluxPressure、zeroGradient / symmetry、fixedValue / uniformFixedValue、prghPressure、prghTotalPressure、totalPressure（10-20 加；只认默认 U / phi / rho、psi none，即 p_rgh = p0 − ½ρ·neg(φ)·\|U\|²）。竖直开口要用 totalPressure 或 fixedValue（开口外按静水压），不要用 p / p0 均匀的 prghPressure / prghTotalPressure，见 6.4 |
+| fvOptions | scalarSemiImplicitSource（h 或某个组分，all / cellZone，absolute / specific）、fixedTemperatureConstraint（uniform，cellZone） |
+
+### 5.5 开发和验证（NAS 容器）
+
+```bash
+./tools/nas.sh 'BACKEND=omp bash /w/tools/build_app.sh'               # 编到 build/omp
+./tools/nas.sh 'BACKEND=cuda ARCH=sm_86 bash /w/tools/build_app.sh'   # 编到 build/cuda（NAS RTX 3080）
+./tools/nas.sh 'for m in m1 m2 m3 m4 m5 m6 m7 m8; do BACKEND=cuda bash /w/verify/$m.sh; done'
+```
+
+`tools/nas.sh` 读不入库的 `tools/nas.env`（主机、密钥、目录），格式见 `tools/nas.env.example`。验证脚本只打印误差，不自动判通过，要人看。
+
+## 6. 现状与下一步（10-20，Claude 接手后）
+
+### 6.1 10-20 做了什么
+
+M0～M7 是 Gemini 做的（10-19），10-20 起 Claude 接手，按“搭配 OpenFOAM 使用的求解器”的目标改：
+
+- functionObjects 每步拿到当前场（以前只在写出时刻同步，每步读到的是旧场且不报错）；残差写进 `mesh.data()`，solverInfo 能记；登记不写出的 `h` 场（= 设备上的 cp·T + e）。新增 `verify/m8.sh` 和 OpenFOAM 对照。
+- `./Allwmake` 标准安装；ddtSchemes 非 Euler 报错；PBiCGStab 认 `preconditioner GAMG`。
+- 主循环分段计时（每次运行结束都打印）；库内分段计时 `GPUCHT_PROF=1`（会在每段前后同步设备，只在分析时开）。
+- 线性求解器的工作数组改成常驻复用（不再每次求解申请/释放约 10 块显存）：结果逐位不变，140 万单元算例快 10%。
+- AMG 聚合只在第一次求解时做（两遍配对），同时记下细→粗系数的收集映射；之后每 10 次求解只按映射刷新粗网格系数、光滑器和最粗层逆（不再排序重建）。重建 116 ms → 刷新 19 ms（其中最粗层 CPU 稠密求逆 17 ms），140 万单元算例再快 6%。预条件器变了，结果不再逐位相同：p_rgh 平均迭代 4.5 → 4.8，和改前差 1e-4 K / 3.5e-5 m/s（容差以内）。
+- 回归：工作数组复用之前的各项改动，同一后端前后结果逐位相同（M5、M6、M7 差 0；M1 1e-11 K）；AMG 改动后 M1～M8 与 OpenFOAM 的误差和改前同一量级（逐项对比：`python verify/cmp_logs.py 改前日志 改后日志`）。
+
+10-20 第二段（换会话后接着做）：
+
+- AMG 再提速（上一段末尾已写进代码、这一段编通并测过）：配对改成按对称的边优先级（edgeRank）在强连接（≥ 0.85 × 本单元最强，`GPUCHT_AMG_STRONG` 可改，扫过 0.25～1.0）里互选，原来"取最强邻居"在渐变网格上会连成链、粗化慢；最粗层 500 → 200 个单元（CPU 稠密求逆 17 → 0.5 ms，列主序存放，GPU 上按列合并访存）；粗层 CSR 乘法每行多线程（4～32 线程一组，按每行非零数选）合并访存；PCG / BiCGStab / AMG 里成对的点积合成一次归约。测速算例 5 步 2.08 → 1.69 s，与 OpenFOAM 的差仍是原量级（见 6.2）。
+- p_rgh 边界加 OpenFOAM 的 `totalPressure`（6.4 第 2 条的原因）。
+- 和 OpenFOAM 对齐的三处：`div(phi,Yi_h)` 写 bounded 报错（OpenFOAM 报 Unknown convection type bounded，我们以前默默接受）；nOuterCorrectors 1 时给了 p_rgh 场松弛报错（以前朝过期的 prevIter 松弛，结果悄悄错）；每步打印库朗数和固体扩散数（固体那部分 sqr(deltaCoeffs) 的最大/平均只在第一次算，以后不再每步在主机上建面场）。
+- **多色 DILU / DIC 与 Gauss-Seidel**（代替 Jacobi，5.4 线性求解器一行）：每个系统第一次求解时着色（JPL，结果确定，0.86 M 单元 6 色、2.6 ms），同时建一份按颜色排的 CSR（同色行连续、每行先放更早颜色的邻居），每次求解按映射填一次值；DILU 分解、前代回代、Gauss-Seidel、smoothSolver 和 Krylov 的 A·x 都读这份连续数据。AMG 最细层另有一份按编号排的 CSR（PCG 的 A·x 也用它），乘法 0.343 → 0.134 ms。显存：颜色 CSR 每个用到的系统约 110 B/单元，AMG 最细层 CSR 约 100 B/单元；全楼空气区两份约 4.8 GB、能量系统（4245 万单元）约 4.7 GB，合计约 9.5 GB，第 4 节的估算里没有。
+- 效果：测速算例 k、ε 每次 5 → 1.3 次迭代，5 步 1.69 → 1.50 s；V7（10 s 步长保守设置）水汽 23 → 9 次、k/ε 5 → 2 次、压力 15.1 → 11.9 s；M3 水汽 200+ → 约 95 次（OpenFOAM 自然编号的 DILU 25～48 次：多色次序比编号次序收敛慢 2～4 倍，是这类方法的通病）。很小的算例（M3 只有 5776 单元）多色扫描的核函数启动开销占主导，GPU 反而更慢，这种规模本来就该用 CPU。
+- 查清 V7 切块起步和大步长发散的原因，见 6.4；新工具 `verify/v7_dt.sh`（步长扫描，GPU 或 OpenFOAM）、`verify/hydro_p.py`（静水压初始 p）、`verify/mesh_slivers.py`（薄片单元统计）、`verify/diag_cells.py`（单元各面的邻居、非正交角、速度）。
+
+### 6.2 测速算例（`verify/bench_case.sh` + `verify/bench_run.sh`）
+
+V5 方腔改成三维、加密、放大 30 倍（3 m 腔体），RNG k-ε + 壁面函数，左右壁一热一冷，前后为绝热无滑移壁。`bench_case.sh OUT 2 60` 得 139 万单元（空气 86 万）。步长 0.05 s、每步 3 次外迭代、5 步，容差同 V7 建筑算例：
+
+| | 每步 | 5 步 |
+| --- | ---: | ---: |
+| chtMultiRegionGpuFoam，NAS RTX 3080（10-20 工作数组复用后） | 0.44 s | 2.21 s |
+| 同上，再加 AMG 聚合只做一次 | 0.42 s | 2.08 s |
+| 同上，再加 6.1 第二段的 AMG 改动（10-20） | 0.34 s | 1.69 s |
+| 同上，再加多色 Gauss-Seidel（U、h、k、ε 的 smoothSolver）和最细层 CSR（10-20） | 0.30 s | 1.50 s |
+| OpenFOAM chtMultiRegionFoam，8 进程 scotch | 4.4 s | 21.8 s |
+
+参考点放在腔体中央时（`pRefPoint (2.1 2.1 1.5)`），t = 0.25 s 两者差：空气 U 最大 1.7e-5 m/s（场量级 0.0093），T 最大 1.2e-3 K（三面交角单元，rms 2.3e-5 K），固体 T 1e-8 K。第二段 AMG 改动后：U 5.5e-5 m/s（rms 1e-6），T 1.16e-3 K（rms 2.3e-5 K），固体 T 3e-8 K。
+
+1.69 s 的构成（`GPUCHT_PROF=1`）：压力 0.86 s（其中线性求解迭代 0.50 s：AMG 预条件 0.42 s = 最细层 LDU 乘法 0.24 s + 粗层 0.12 s），动量 0.28 s，湍流 0.24 s，能量 0.17 s。最细层改 CSR 后（1.50 s 那行）：压力 0.65 s（AMG 预条件 0.27 s = 最细层 0.09 s + 粗层 0.12 s），动量 0.32 s，湍流 0.23 s，能量 0.19 s。线性求解以外的组装（梯度、矩阵组装、边界）现在约占一半：例如最小二乘梯度每次 0.64～1.9 ms，按带宽估约可快 2～3 倍，但要改成按单元连续存放最小二乘向量（全楼多几 GB 显存），没有 Nsight 不好细查，暂不做。
+
+两处要知道的现象：
+- **步长 1 s 时两个求解器都发散**（OpenFOAM 第 3 步库朗数 354 后浮点异常），所以默认 0.05 s。
+- **封闭腔 + Boussinesq 时参考单元出尖峰**：总质量随温度变，压力方程不相容，不平衡全落在 pRefCell 一个单元上。参考单元若是加密角上的小单元，速度尖峰可达 0.3 m/s（OpenFOAM 同样，只是并行时 `pRefCell 0` 是 0 号进程的 0 号单元，落在别处）。比对时两边要用同一个 `pRefPoint`，最好放在大单元。全楼有开口（prghPressure / prghTotalPressure），不需要参考单元，不受影响。
+
+耗时构成（`GPUCHT_PROF=1`，上表 GPU 一行）：压力 61%（线性求解 1.17 s，其中 AMG 重建 3 次共 0.35 s：Galerkin 排序 54 ms/次、配对 24 ms、最粗层 CPU 稠密求逆 16 ms），动量 13%，湍流 11%，能量 7%。
+
+### 6.3 下一步（按收益/风险排）
+
+0. **全楼算例生成两处要改**（6.4 第 2、3 条）：`tower_louver_opening` 的 p_rgh 改 `totalPressure`——Py 版 `building/make_building_case.py` 已改（10-20）；初始 p 写成静水压（hRef 0 时 p = P0 − ρ·9.81·z）——生成后跑 `verify/hydro_p.py`，写在生成脚本说明里。NAS 上 `r3d_mr` 的 `0/` 还没重新生成。
+1. **网格薄片单元**（6.4 第 5、6 条，要用户定）：大步长卡在薄于约 5 mm 的空气单元和 20:1 的尺寸突变上。来历：全局嵌套网格线（0.4 / 0.1 / 0.05 / 0.025 / 0.0125 m）落在离材料分界线几毫米处就切出薄层，例如 V7 东墙面 x = 47.855、网格线 x = 47.85。根治是在分层网格生成（`../layered_hex_proto_2f_r1/layered_mesh_r3d.py`）里去掉离材料分界太近的网格线，让贴墙单元吸收这段距离，然后重跑全楼网格（NAS 五段 + 缝合，峰值约 21 GB、数小时）和后续拆区、建算例。不改的话保守设置下约 10 s 步长，而且不稳。
+2. ~~多色 DILU / Gauss-Seidel~~、~~AMG 最细层 CSR~~（10-20 已做，6.1）。剩下：多色次序的 DILU 比 OpenFOAM 编号次序多 2～4 倍迭代，可试更好的次序（如按几何分块后块内顺序扫）；单精度 V 循环（压力预条件再省约 0.1 s / 1.5 s）。
+3. 组装部分（梯度、矩阵组装）现在约占一半时间，见 6.2 末尾。
+4. 全楼 `r3d_mr` 还没在 GPU 上实跑过：显存、首步稳定性都要在 96 GB 卡（Colab G4，sm_120）上实测，开机要用户同意。
+5. 多卡 / `-parallel`：工作量大，暂不做。
+
+### 6.4 V7 建筑切块（房间 2S5，35.99 万单元）：起步和大步长（10-20）
+
+上午查到的现象（0.02 s 步长、`verify/v7_steps.sh`）：每步 20 次外迭代时 OpenFOAM 和本求解器都在第 1 步发散；每步 1 次外迭代时第 2 步起两边分开。M5/M6 只比第 1 步、只列固体温度，把这个盖住了（M6 第 2 步空气 T 与 Py 版差 11.5 K）。下午逐条查清，结论都是**算例和网格的问题，两个求解器表现一致**（凡是对照过的，炸的位置、时刻、量级都相同）：
+
+1. **封闭盒子不可解**。v7_std 所有风口都是定流量、没有定压开口（送 0.5757、回 0.5772 kg/s），Boussinesq 下平均密度一变，压力方程就没有解。全楼有百叶开口，不是这种情况；切块要测就得开一个口。`verify/v7_exp.sh` 的变体把切割面 `domain_side` 改成开口（补丁类型 wall → patch，nut / alphat 改 calculated——不改的话 OpenFOAM 照算，本求解器因 ε 与壁面函数不成对报错）。
+2. **竖直开口不能用均匀静压**。`side` 变体用 prghPressure（p 均匀）：竖直面上静压处处相同不是静水压，按 ρgΔz 驱动假流动，库朗数 5 → 15 → … → 5622，第 18 步炸。改用 p_rgh `totalPressure`（`side_tp`，开口外按静水压）后库朗数稳在 1.8。全楼 `tower_louver_opening`（z 19.80～20.75 m，0.95 m 高）现在是 prghTotalPressure + 均匀 p0，同样有约 11 Pa 的假压差。
+3. **初始 p 不是静水压**。chtMultiRegionFoam 开算时 `p_rgh = p − ρ·gh`（v2606 createFluidFields.H 第 190 行），而算例的 p 文件是均匀 100090 Pa，初始 p_rgh 就带着 ρg ≈ 11 Pa/m 的梯度。0.02 s 步长看不出；1 s 步长时第 1 次外迭代的动量预测就把开口底部加速到 10.2 m/s（OpenFOAM）/ 15.4 m/s（本求解器）。初始 p 改成静水压（`verify/hydro_p.py`；OpenFOAM 里也可用 setExprFields）后同一处 0.908 / 0.906 m/s，连续性误差 0.24 → 3e-4。全楼高约 25 m，均匀 p 相当于约 290 Pa 的假压差。
+4. **0.02 s 步长下也会慢慢长起来**（totalPressure 开口、均匀初始 p）：OpenFOAM 在 0.42 s（第 21 步）炸，本求解器同一时刻停。炸点是 x = 40.33、y = −0.33 一列贴抹灰的单元，朝 −y 的面非正交 56.8°（悬挂节点过渡），速度 0.36 s 8.7 m/s → 0.40 s 479 m/s；prghPressure 那次也在这一列炸。
+5. **大步长**（静水压初始 p、totalPressure 开口；GPU 上测，`verify/v7_dt.sh`）：
+
+   | 设置 | 1 s | 10 s | 60 s |
+   | --- | --- | --- | --- |
+   | 原设置 + 对流加 bounded（Yi 不能加）+ 最后一次外迭代也松弛 | 第 1 步收敛，第 2 步第 8 次外迭代起温度上爬后炸 | 第 1 步就坏 | 第 1 步炸 |
+   | 同上，p_rgh 松弛 0.3 | 第 2 步更早炸 | 第 1 步炸 | 第 1 步炸 |
+   | 保守：全部一阶迎风（U、h、k、ε 加 bounded），U 0.5、p_rgh 0.3、h 0.7、k/ε 0.5、水汽 0.7，Final 同样松弛，nCorrectors 1、nNonOrthogonalCorrectors 1 | — | **30 步（300 s）不炸**，空气 290.9～309.9 K（偶有局部尖峰后回落），每步 1.1 s；OpenFOAM 同设置第 2 步炸 | 第 2 步炸 |
+
+   换成多色 DILU / Gauss-Seidel 之后同一保守设置：一版 30 步不炸（空气 290.6～302.4 K，比 Jacobi 版平稳），颜色 CSR 版第 18 步能量方程发散。三版都有同一现象：**每步第 1 次外迭代空气温度冲出很高**（Jacobi 版最高 539.6 K、多色版 377 K），之后 20 次外迭代拉回；哪一步拉不回来带偶然性。所以 10 s 步长在这套网格上处在边缘，与线性求解器无关。尖峰来自薄片单元里的假速度经能量方程的动能项（`fvc::ddt(rho,K) + fvc::div(phi,K)`，chtMultiRegionFoam 的 EEqn 固定带、没有开关）放大。核对过一次：从 43370 s 重启做 2 次外迭代，最热单元（308 K）和最快单元（96 m/s）是同一个——开口底部贴地面的 5 mm 薄片（V = 2e-5 m³）；上一步收敛时最大速度 7.1 m/s 也在一个 8.8e-7 m³ 的极小单元里。
+
+   第 2 步炸的位置是东墙 x ≈ 47.85、z ≈ 7.1 m 的 2.5 mm 厚贴墙薄片单元（旁边单元厚 50 mm，尺寸比 20:1，长宽比约 60），垂直于墙的速度在薄片两侧正负交替（−1009 / +220 / −114 m/s），是压力-速度失耦。另外 1 s 步长、初始 p 均匀时，我们的水汽方程（Jacobi-BiCGStab，代替 DILU）在第 2 次外迭代就发散，OpenFOAM 的 DILU 14 次收敛（之后 OpenFOAM 在能量方程炸）——更强的预条件器也关系稳健性。
+6. **网格**（`verify/mesh_slivers.py`）：V7 空气区 22.07 万单元中 1.37% 薄于 2.5 mm（最薄 0.25 mm）、5.0% 薄于 10 mm；0.23% 的面两侧体积比 > 20；0.12% 的面非正交 > 70°。这些是分层网格按全局嵌套网格线切出来的薄层，全楼同样会有。
+
+按 V7 的每次外迭代耗时外推（测速算例每百万空气单元 0.13 s、V7 0.26 s，G4 带宽约是 3080 的 2.4 倍），全楼在 G4 上每次外迭代约 1.2～2.6 s：10 s 步长 × 20 次外迭代算一个设计日约 2.4～5 天；60 s 步长 × 10 次约 5～10 小时。所以 6.3 第 1 条（网格）决定全楼能不能在合理时间内算完。
+
+### 6.5 第三段（10-20 晚，用户"继续优化这个求解器"）
+
+**新测速算例 `bench_k4`**（`bench_case.sh OUT 4 120`，1109 万单元、空气 691 万，约全楼 1/4，NAS 3080 上显存 13.6 GB）。注意它是**封闭方腔**：Boussinesq 下壁面一加热总质量就变，压力方程不相容，误差堆在参考单元上，而且和步长成反比。`pRefCell 0`（加密角上的小单元）时第 1 步库朗数 185 就炸；改 `pRefPoint (2.1 2.1 1.5)` 后，步长 0.02 s 前 3 步正常、第 4 步起发散，0.005 s 第 2 步就发散——OpenFOAM（8 进程）同样设置同样发散（0.02 s 第 4 步库朗数 10.9 且在涨；0.005 s 第 2 步崩溃）。所以测速固定用 0.02 s、3 步（`endTime 0.06`），不拿它比物理结果。全楼有开口，不是这种情况。另外 OpenFOAM 打印的 `Min/max T` 含边界面值，以前我们只统计单元，两边日志看起来差很多，其实是统计口径不同（本段已改成同口径，见下）。
+
+**大网格下的耗时结构**：在这个规模上逐段同步计时（`GPUCHT_PROF=1`）几乎不增加总时间（8.21 s 对 8.17 s），说明核函数启动/同步开销可以忽略，瓶颈是显存带宽：线性求解约 44%（压力 AMG 预条件最大）、方程组装和梯度约 39%。小算例（V7、M 系列）正相反，主要是启动/同步开销。
+
+**改动**（按做的顺序）：
+
+1. Thrust 的 `thrust::device` 在每个核函数后同步一次流（CUDA 12.8 自带 Thrust 2.7，`for_each.h` 里 `synchronize_optional`），GPU 在 CPU 发下一个核函数时空等。`par.h` 的 `pol()`：CUDA 下 `thrust::cuda::par_nosync`，`for_n`、`fill`、`copy` 和求解器里的向量拷贝都用它，按默认流顺序排队；需要结果的地方（归约、拷回主机、释放显存）照常等待。结果逐位不变。
+2. 热点里每次调用临时申请显存的地方改为复用：动量预测的 `pb`、`rec`、`x`，压力的 `pbv`、`rc`（改用 `wS`、`HbyA`、`rAU`，这些在当时是空闲的），`setValues` 的标记数组（改用线性求解工作槽）。结果逐位不变。
+3. 全楼才会暴露的主机↔显卡往返：
+   - fvOptions（房间散热 h、人员散湿水汽）：以前每次外迭代在 CPU 上建全体单元的 Su/Sp 再整块上传（全楼 h 约 680 MB、水汽约 360 MB/次）；现在 `Engine::sourceSet` 开算时上传一次单元表，`sourceValues` 每次只传各源的数值，在显卡上按源的顺序累加（乘积先舍入，与原主机循环逐位相同）。
+   - `fixedTemperatureConstraint` 只在温度值变化时上传。
+   - 压力后的 `Min/max rho` 在显卡上求（以前拷回整个密度场）。
+   - HVAC 控制器每步：只取边界槽的水汽（以前拷回整个 Y 场）、在显卡上取边界面所在单元的 p（以前拷回整个 p 场）。
+4. 日志口径与 OpenFOAM 一致：`Min/max T` 每区含单元、边界面、本区一侧的界面温度（`Engine::energyMinMaxT`，一个核函数一次拷回，代替以前每区两次归约）；`Min/max rho` 含边界槽。只影响日志。
+5. 面上的量每个面只算一次（以前两侧单元各算一次）：
+   - 能量组装：`faceTerms` 里 dO = −lo、dN = −up、sN = −sO 是精确的（成对的运算互为镜像），所以单元行只读 upper/lower 和新加的面数组 `fS`（每面 8 B，全楼约 1 GB）。cells 35 → 8 ms，faces 6 → 14 ms。
+   - 动量组装：`uFace` 每面算一次存进空闲的面数组（`pCorr`、`phig`、`phiHbyA`、`rhorAUf`，pressure() 用前会重算）。40 → 22 ms。
+   - 动量预测的 reconstruct、压力后的 U 重构：面通量先算进面数组再按单元收集。25 → 12 ms、17 → 13 ms。
+   因为存进显存后编译器不能再把乘法和后面的加法合成一条 FMA，结果不再逐位相同，差在舍入级（见下）。
+6. **压力 AMG 的 V 循环改单精度**（Krylov 迭代仍是双精度、柔性 PCG）：各层算子的 float 副本（第 0 层 `v0f`、`d0f`，粗层 `Csr::toFloat`），float 向量；每次 Jacobi 光滑和它的矩阵乘合成一个核函数（`csrRows` + `EpJac` / `EpRes` / `EpAx`）；粗网格修正的最小残差系数归约到显存（`dot2Dev`，CUB），一次 V 循环不再回主机。每次预条件 13.3 → 8.1 ms（第 0 层乘法 1.15 → 0.78 ms，粗层 4.9 → 2.9 ms）；bench_k4 的 18 次压力求解迭代次数和改前**完全相同**。`test_lib` 的 48³ 方腔 PCG+AMG 到 1e-12 由 37 步变 43 步（单精度预条件在极严容差下的代价，实际容差下看不出）。
+7. 线性求解开头：有效对角/源项、A x、行和合成一遍扫描（逐位不变），6.0 → 4.3 ms/次；Gauss-Seidel 的残差检查不再写残差向量，按行直接归约。
+8. 第二个压力修正的 grad(rho) 复用第一个的（两次之间 T 不变，rho 逐位相同）。
+9. 第一步结束时打印显存占用（`device memory after the first time step`，此时 AMG、着色等都已建好），用于全楼上 96 GB 卡前的估算。
+
+**测速**（NAS RTX 3080，`GPUCHT_PROF=0`）：
+
+| 算例 | 改前 | 改后 | |
+| --- | ---: | ---: | --- |
+| bench_k4（1109 万单元，3 步 × 3 外迭代） | 8.21 s | 6.49 s | −21% |
+| V7 切块，10 s 步长保守设置（6.4），10 步 × 20 外迭代 | 8.93 s | 6.19 s | −31% |
+| M3（湿空气，5776 单元，30 步） | 18.0 s | 11.4 s | −36%（第 1 条） |
+| M5 ftc60 | 14.9 s | 10.2 s | −32% |
+| M4（湍流 V5） | 4.67 s | 3.35 s | −28% |
+| bench_k2（139 万单元） | 1.61 s | 1.42 s | −12% |
+
+bench_k4 改后每次外迭代约 0.72 s，构成：压力 2 次修正 0.31 s（线性求解 0.19 s），动量 0.13 s，湍流 0.12 s，能量 0.08 s。
+
+**结果检查**：
+- 第 1～2 条改完时，M1、M3、M4、M5 ftc60、M6 adj、M6 V7 full、bench_k2、bench_k4 全部场与改前**逐位相同**（`verify/ab.sh`：两个 build 跑同一批算例逐场对比）。
+- 第 5、6 条以后：与改前差在舍入/求解容差级（bench_k2 0.25 s 时 T 1.3e-7 K、U 1e-6 m/s；M4 2 s 时 T 4.6e-9 K；较长的 M3、M5 到 1e-7～1e-6 K，是容差附近迭代次数差 1 次带来的）。bench_k4 的 p_rgh 有约 0.002 Pa 的整体平移：封闭腔压力的常数分量只由参考单元弱约束，容差内就会漂（OpenFOAM 同）。
+- V7 10 s 保守设置 10 步后两版差别大（空气 T 最大 8 K）：第 1 步各方程残差两版相同到 7 位以上（只有 p_rgh 末位不同），之后局部库朗数上千（两版都是，第 2 步 970），薄片单元的尖峰把舍入差放大——即 6.4 说的"10 s 在这套网格上处在边缘、带偶然性"，不是新问题。
+- 与 OpenFOAM 对照（M 系列，改后）：M2 t = 60 s 空气 T 差 4.2e-5 K（第 3 节记录 4.1e-5，OpenFOAM 15 与 60 次外迭代之差 5.3e-5）、U 3.1e-7 m/s；M2 `TIGHT=1`（所有线性求解 relTol 0）t = 10 / 60 s 空气 T 差 1.7e-6 / 4.4e-6 K、U 5e-8 / 1.3e-7 m/s（6.1 记录 2.9e-6 K），即单精度预条件不影响收敛到的解。M4 t = 2 s 空气 T 2.9e-5 K、U 2.2e-6 m/s；M5 ftc60 t = 60 s 空气 T 6.4e-5 K；M5 V7 单步空气 U 0.033 m/s（量程 0.83）。M4、M5 的这些数比第 3 节表里的大，但**用本段改前的程序（`build/cuda_base`）跑同样脚本得到的差完全一样**（M4 2.865e-5 K 两版相同），所以不是本段改动造成的，是第 3 节之后脚本或算例变过，第 3 节表里的数不能直接拿来比。
+
+**显存实测**（新加的第一步后打印）：bench_k4 网格后 8.35 GB、场后 13.84 GB、第一步后 18.26 GB（AMG、着色、12 个求解工作向量等约 4.4 GB），约 1.65 GB/百万单元。按单元数外推全楼 `r3d_mr`（4245 万）：网格 + 场约 53 GB，求解结构约 16 GB（工作向量按最大的能量系统 4245 万计，12 × 8 B × 4245 万 ≈ 4.1 GB），合计约 70 GB，96 GB 的 G4 放得下（第 4 节估算 57 GiB 没算着色和最细层 CSR）。仍以 G4 上实测为准。
+
+新工具：`verify/ab.sh`（两个 build 的回归对比）。NAS 上 `build/cuda_base` 是本段改动前的程序。
+
+**下一步**（接 6.3）：
+- 6.3 第 1 条（薄片单元，决定能不能用 60 s 步长）仍是最大的事，要用户定。
+- 求解器还可做的两项见 6.6（已做）。
+- 全楼还没在 GPU 上实跑；在 G4 上开机前要用户同意。
+
+### 6.6 第四段（10-20 夜，用户"先把那几个可以优化的优化一下"）
+
+对照基准：NAS `build/cuda_r2` = 6.5 结束时的程序。
+
+1. **每个"单元-面"条目预存对面的单元号**（省掉 cell-face 循环里对 own / nei 的一次分散读取）：结果逐位相同，但 bench_k4 6.46 → 6.46 s、V7 3.18 → 3.18 s，**没有收益**，全楼还要多约 1 GB 显存，已撤回。原因见第 3 条：OpenFOAM / 分层网格的单元编号局部性好，own / nei 基本在缓存里。
+2. **用着色次序的系统整体在颜色序里解**（保留）：smoothSolver（Gauss-Seidel、DILU 光滑）和 DILU / DIC 预条件的系统，solve() 在算完 normFactor 后把 d、b、x（Krylov 方法还有 r）按颜色行序重排，整个迭代在行序里做（着色 CSR 的列号存的是行号），最后把 x 排回单元序；不多占显存（借用现有工作向量和 x 本身）。同色的行连续，自身的读写变成连续访问：每次迭代动量 9.6 → 7.6 ms、湍流 10.4 → 8.1 ms、能量 12.9 → 10.3 ms，但重排本身每次 1.5～2.3 ms，这几个方程每次只迭代 1～2 次，所以 bench_k4 净 6.46 → 6.37 s（−1.5%）；迭代多的水汽方程（DILU-BiCGStab，约 9 次）受益大：V7 10 s 设置 5 步 3.18 → 3.02 s（−5%，水汽 0.605 → 0.537 s）。Gauss-Seidel 的结果与改前逐位相同（运算和求和次序都没变）；Krylov 方法的点积按行序求和，差在舍入级。
+3. **单元编号顺序的影响**（`verify/ordering.py`：内部面两侧单元号之差 |own − nei|）：
+
+   | 空气区 | 单元 | 中位数 | 90% 分位 | 测速 3 步 |
+   | --- | ---: | ---: | ---: | ---: |
+   | bench_k4（blockMesh 原序） | 691 万 | 240 | 57600 | 6.37 s |
+   | bench_k4，`renumberMesh`（CuthillMcKee） | 691 万 | 19980 | 25019 | 6.20 s（−2.7%） |
+   | bench_k4，`renumberMesh` method random | 691 万 | 202 万 | 473 万 | **17.76 s（2.8 倍）**，压力 3.5 倍 |
+   | V7 切块原序 | 22 万 | 30 | 660 | — |
+   | **全楼 r3d_mr 原序** | 2272 万 | **30** | **1020** | — |
+
+   编号乱的话 GPU 慢近 3 倍；全楼网格 90% 的面两侧单元号相差 ≤ 1020，局部性好（固体区如 concrete_substrate 中位数 12，但 90% 分位 38 万，尾巴长些），所以不需要重排；`renumberMesh -allRegions -overwrite` 可能再快几个百分点，可在上 G4 前顺手做（要 NAS 内存和时间，属于改用户算例，先问）。V7 原序重排后（带宽 218975 → 2371）测不出差别：V7 小，受核函数启动限制。
+   注意：多区算例用 `renumberMesh -dict system/renumberMeshDict` 时，字典要放在每个区的 `system/<区>/` 下；不带 `-dict` 时用默认 CuthillMcKee。HVAC 的房间单元取自 cellZone `room_*`，重排后照样对得上。
+4. **AMG V 循环形状扫描**（`verify/amg_shape.sh`，新加环境变量 `GPUCHT_AMG_PRE` / `GPUCHT_AMG_POST` / `GPUCHT_AMG_MR`，默认 1 / 2 / 1 即原来的做法）：bench_k4 上默认 6.36 s、p_rgh 共 143 次迭代；后光滑 1 次 6.61 s / 187 次；不做最小残差缩放 6.28 s / 168 次（快 1%、迭代多 17%，难的算例上可能反而慢，不改）；前光滑 2 次 6.55 s / 140 次；前光滑 0 次 6.36 s / 163 次。默认已是最好，保持不变。
+
+检查（第 2 条以后，`verify/ab.sh cuda_r2 cuda`）：M1、M4、M5 ftc60、M6 adj、bench_k2 全部场与 cuda_r2 逐位相同（只用 Gauss-Seidel）；M3（水汽 DILU-BiCGStab）差 ≤ 2.4e-5 K、水汽 3e-8；M6 V7 full U 3e-6 m/s。与 OpenFOAM：M5 两部分与 6.5 完全相同；M3 full 变体 t = 10 / 60 s 空气 T 差 0.063 / 5.0e-4 K，偏大，但 cuda_r2 和本会话开头的 cuda_base 跑同一脚本得到同样的 0.0627 / 5.1e-4 K，不是这次改动造成的（full 变体水汽 Href 2501000，即之前记下的"OpenFOAM 对焓常数偏移敏感"那类情况，留待查）。
+
+新工具：`verify/ordering.py`（网格编号局部性）、`verify/amg_shape.sh`（V 循环形状扫描）。

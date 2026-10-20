@@ -40,6 +40,7 @@ struct Energy
     dvec<double> aB, bB, TbB, GbB;            // boundary: T_b = aB + bB T_P, T_b, conductance alphaEff |S| dc
     dvec<double> gA, gB, G, TA, TB;           // interface: side conductances, series conductance, patch T
     dvec<double> h, grad;                     // he per cell, (limited) grad(he)
+    dvec<double> fS;                          // region faces: explicit face terms to the owner row (assemble)
     Ldu M;
     AmgCache amg;
 

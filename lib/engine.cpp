@@ -3,10 +3,25 @@
 #include "energy.h"
 #include "flow.h"
 
+#include <algorithm>
 #include <memory>
 
 namespace gc
 {
+
+namespace
+{
+// a + b c with the product rounded first (no fused multiply-add), as the host loop the device sources replace
+HD inline double addProdRn(double a, double b, double c)
+{
+#if defined(__CUDA_ARCH__)
+    return __dadd_rn(a, __dmul_rn(b, c));
+#else
+    const double p = b*c;
+    return a + p;
+#endif
+}
+} // namespace
 
 struct Engine::Impl
 {
@@ -14,6 +29,27 @@ struct Engine::Impl
     Energy E;
     Building bld;
     std::vector<std::unique_ptr<Flow>> fl;
+
+    // fvOptions sources (Engine::sourceSet): per cell with sources its entries (source index, weight) in source
+    // order
+    struct SourceSet
+    {
+        double *Su = nullptr, *Sp = nullptr;
+        long nK = 0;
+        dvec<int> cell, ptr, src;
+        dvec<double> w, su, sp;
+    };
+    std::vector<SourceSet> srcs;
+
+    // energyMinMaxT: the cell / patch-face ranges of every region in chunks of at most 4096 values, each reduced
+    // by one thread; array 0 T, 1 TbB, 2 TA, 3 TB
+    struct MinMaxSegs
+    {
+        std::vector<int> region;
+        dvec<int> arr, start, len;
+        dvec<double> mn, mx;
+    };
+    std::unique_ptr<MinMaxSegs> mmT;
 
     Flow& flow(int id)
     {
@@ -187,9 +223,79 @@ double Engine::memGB() const
     return mem_gb();
 }
 
+void Engine::sync() const
+{
+    gc::sync();
+}
+
+std::string Engine::profReport() const
+{
+    return prof_report();
+}
+
 void Engine::energyBoundaryState()
 {
     p_->E.boundaryState();
+}
+
+void Engine::energyMinMaxT(std::vector<double>& mn, std::vector<double>& mx) const
+{
+    const DMesh& m = p_->m;
+    const int nR = int(m.regions.size());
+    if (!p_->mmT)
+    {
+        std::unique_ptr<Impl::MinMaxSegs> s(new Impl::MinMaxSegs());
+        std::vector<int> arr, start, len;
+        auto add = [&](int r, int a, long s0, long n) {
+            for (long k = 0; k < n; k += 4096)
+            {
+                s->region.push_back(r);
+                arr.push_back(a);
+                start.push_back(int(s0 + k));
+                len.push_back(int(std::min(4096L, n - k)));
+            }
+        };
+        for (int r = 0; r < nR; ++r)
+        {
+            add(r, 0, m.regions[r].c0, m.regions[r].nC);
+            add(r, 1, m.regions[r].b0, m.regions[r].nB);
+        }
+        for (const MeshIn::Pair& pr : m.pairs)
+        {
+            add(pr.rA, 2, pr.f0 - m.nIr, pr.n);
+            add(pr.rB, 3, pr.f0 - m.nIr, pr.n);
+        }
+        s->arr = to_dev(arr);
+        s->start = to_dev(start);
+        s->len = to_dev(len);
+        s->mn.resize(arr.size());
+        s->mx.resize(arr.size());
+        p_->mmT = std::move(s);
+    }
+    Impl::MinMaxSegs& s = *p_->mmT;
+    const double* src[4] = {ptr(p_->E.T), ptr(p_->E.TbB), ptr(p_->E.TA), ptr(p_->E.TB)};
+    const double *T = src[0], *Tb = src[1], *TA = src[2], *TB = src[3];
+    const int *ar = ptr(s.arr), *st = ptr(s.start), *ln = ptr(s.len);
+    double *omn = ptr(s.mn), *omx = ptr(s.mx);
+    for_n(long(s.region.size()), [=] HD (long q) {
+        const double* a = ar[q] == 0 ? T : (ar[q] == 1 ? Tb : (ar[q] == 2 ? TA : TB));
+        double lo = 1e300, hi = -1e300;
+        for (int i = st[q]; i < st[q] + ln[q]; ++i)
+        {
+            lo = dmin(lo, a[i]);
+            hi = dmax(hi, a[i]);
+        }
+        omn[q] = lo;
+        omx[q] = hi;
+    });
+    const std::vector<double> hmn = to_host(s.mn), hmx = to_host(s.mx);
+    mn.assign(nR, 1e300);
+    mx.assign(nR, -1e300);
+    for (size_t q = 0; q < s.region.size(); ++q)
+    {
+        mn[s.region[q]] = std::min(mn[s.region[q]], hmn[q]);
+        mx[s.region[q]] = std::max(mx[s.region[q]], hmx[q]);
+    }
 }
 
 void Engine::setEnergyConvection(int conv, double k, bool bounded)
@@ -197,6 +303,92 @@ void Engine::setEnergyConvection(int conv, double k, bool bounded)
     p_->E.conv = conv;
     p_->E.convK = k;
     p_->E.bounded = bounded;
+}
+
+int Engine::sourceSet(int fluidId, int sp, const std::vector<std::vector<int>>& cells,
+                      const std::vector<std::vector<double>>& w)
+{
+    Impl::SourceSet s;
+    long n = 0;
+    if (fluidId < 0)
+    {
+        s.Su = ptr(p_->E.Su);
+        s.Sp = ptr(p_->E.Sp);
+        n = p_->m.nC;
+    }
+    else
+    {
+        Flow& f = p_->flow(fluidId);
+        if (sp < 0 || sp >= f.nSp) fatal("Engine::sourceSet: bad specie index %d", sp);
+        s.Su = ptr(f.SuY) + long(sp)*f.nc;
+        s.Sp = ptr(f.SpY) + long(sp)*f.nc;
+        n = f.nc;
+    }
+    if (cells.size() != w.size()) fatal("Engine::sourceSet: %zu cell lists, %zu weight lists", cells.size(), w.size());
+    s.nK = long(cells.size());
+    // entries per cell, then each cell's first entry; entries filled source by source keep the source order
+    std::vector<int> at(size_t(n), 0);
+    long ne = 0;
+    for (size_t k = 0; k < cells.size(); ++k)
+    {
+        if (cells[k].size() != w[k].size()) fatal("Engine::sourceSet: source %zu: cells and weights differ", k);
+        for (const int c : cells[k])
+        {
+            if (c < 0 || c >= n) fatal("Engine::sourceSet: source %zu: cell %d outside [0, %ld)", k, c, n);
+            at[c]++;
+        }
+        ne += long(cells[k].size());
+    }
+    if (ne > 0x7fffffffL) fatal("Engine::sourceSet: %ld entries", ne);
+    std::vector<int> cellH, ptrH(1, 0);
+    for (long c = 0; c < n; ++c)
+    {
+        if (!at[c]) continue;
+        const int cnt = at[c];
+        at[c] = ptrH.back();
+        cellH.push_back(int(c));
+        ptrH.push_back(ptrH.back() + cnt);
+    }
+    std::vector<int> srcH(static_cast<size_t>(ne));
+    std::vector<double> wH(static_cast<size_t>(ne));
+    for (size_t k = 0; k < cells.size(); ++k)
+        for (size_t i = 0; i < cells[k].size(); ++i)
+        {
+            const int e = at[cells[k][i]]++;
+            srcH[e] = int(k);
+            wH[e] = w[k][i];
+        }
+    s.cell = to_dev(cellH);
+    s.ptr = to_dev(ptrH);
+    s.src = to_dev(srcH);
+    s.w = to_dev(wH);
+    s.su.resize(s.nK);
+    s.sp.resize(s.nK);
+    p_->srcs.push_back(std::move(s));
+    return int(p_->srcs.size()) - 1;
+}
+
+void Engine::sourceValues(int set, const std::vector<double>& su, const std::vector<double>& sp)
+{
+    if (set < 0 || set >= int(p_->srcs.size())) fatal("Engine::sourceValues: no source set %d", set);
+    Impl::SourceSet& s = p_->srcs[set];
+    if (long(su.size()) != s.nK || long(sp.size()) != s.nK)
+        fatal("Engine::sourceValues: %zu / %zu values for %ld sources", su.size(), sp.size(), s.nK);
+    thrust::copy(su.begin(), su.end(), s.su.begin());
+    thrust::copy(sp.begin(), sp.end(), s.sp.begin());
+    const int *cl = ptr(s.cell), *pp = ptr(s.ptr), *sr = ptr(s.src);
+    const double *wv = ptr(s.w), *a = ptr(s.su), *b = ptr(s.sp);
+    double *Su = s.Su, *Sp = s.Sp;
+    for_n(long(s.cell.size()), [=] HD (long u) {
+        double x = 0.0, y = 0.0;
+        for (int e = pp[u]; e < pp[u + 1]; ++e)
+        {
+            x = addProdRn(x, a[sr[e]], wv[e]);
+            y = addProdRn(y, b[sr[e]], wv[e]);
+        }
+        Su[cl[u]] = x;
+        Sp[cl[u]] = y;
+    });
 }
 
 int Engine::addFluid(const FluidIn& fi)
@@ -237,6 +429,28 @@ std::vector<double> Engine::fget(int id, F a, long offset, long n) const
     if (offset < 0 || offset + n > long(d.size())) fatal("Engine::fget: range exceeds the array size");
     std::vector<double> h(n);
     thrust::copy(d.begin() + offset, d.begin() + offset + n, h.begin());
+    return h;
+}
+
+void Engine::fminMax(int id, F a, double& mn, double& mx) const
+{
+    const dvec<double>& d = p_->farr(id, a);
+    const double* x = ptr(d);
+    const long n = long(d.size());
+    mn = min_n(n, [=] HD (long i) { return x[i]; });
+    mx = max_n(n, [=] HD (long i) { return x[i]; });
+}
+
+std::vector<double> Engine::fgetAtSlotCells(int id, F a, long n) const
+{
+    Flow& f = p_->flow(id);
+    if (n < 0 || n > f.nS) fatal("Engine::fgetAtSlotCells: %ld slots of %d", n, f.nS);
+    const double* x = ptr(p_->farr(id, a));
+    const int* sc = ptr(f.sCell);
+    double* out = ptr(f.wS);
+    for_n(n, [=] HD (long s) { out[s] = x[sc[s]]; });
+    std::vector<double> h(n);
+    thrust::copy(f.wS.begin(), f.wS.begin() + n, h.begin());
     return h;
 }
 
@@ -325,6 +539,17 @@ void Engine::fgetSpecie(int id, int m, std::vector<double>& Y, std::vector<doubl
     thrust::copy(f.Yb.begin() + s0, f.Yb.begin() + s0 + f.nS, Yb.begin());
 }
 
+std::vector<double> Engine::fgetSpecieSlots(int id, int m, long offset, long n) const
+{
+    const Flow& f = p_->flow(id);
+    if (m < 0 || m >= f.nSp || offset < 0 || n < 0 || offset + n > f.nS)
+        fatal("Engine::fgetSpecieSlots: range out of bounds");
+    std::vector<double> h(n);
+    const long s0 = long(m)*f.nS + offset;
+    thrust::copy(f.Yb.begin() + s0, f.Yb.begin() + s0 + n, h.begin());
+    return h;
+}
+
 void Engine::fluidUpdateMixture(int id)
 {
     p_->flow(id).updateMixture(true);
@@ -381,10 +606,11 @@ void Engine::fluidMomentum(int id, double dt, double alphaU, const SolverCtl& ct
     p_->flow(id).momentum(dt, alphaU, ctl, predictor, info);
 }
 
-SolveInfo Engine::fluidPressure(int id, double dt, const SolverCtl& ctl, double pRelax, int nNonOrth, double contErr[2])
+SolveInfo Engine::fluidPressure(int id, double dt, const SolverCtl& ctl, double pRelax, int nNonOrth, double contErr[2],
+                               bool sameRho)
 {
     SolveInfo info;
-    p_->flow(id).pressure(dt, ctl, pRelax, nNonOrth, info, contErr);
+    p_->flow(id).pressure(dt, ctl, pRelax, nNonOrth, info, contErr, sameRho);
     return info;
 }
 

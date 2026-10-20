@@ -220,6 +220,19 @@ int divScheme(const fvMesh& mesh, const word& name, const word& field, int allow
     return k;
 }
 
+void requireEuler(const fvMesh& mesh)
+{
+    for (const entry& e : mesh.ddtSchemes())
+    {
+        if (!e.isStream()) continue;
+        ITstream& is = e.stream();
+        const word s(is);
+        if (s == "Euler" || (s == "none" && e.keyword() == "default")) continue;
+        FatalErrorInFunction << mesh.name() << ": ddtSchemes " << e.keyword() << " " << s
+            << " is not supported (Euler)" << exit(FatalError);
+    }
+}
+
 scalar gradLimitK(const fvMesh& mesh, const word& name)
 {
     ITstream& is = mesh.gradScheme(name);
@@ -239,7 +252,40 @@ scalar gradLimitK(const fvMesh& mesh, const word& name)
     return 0;
 }
 
-gc::SolverCtl readSolver(const fvMesh& mesh, const word& name, bool pressure, bool positive)
+// "preconditioner DIC;" or "preconditioner { preconditioner GAMG; ... }" -> the preconditioner's name
+static word precondName(const dictionary& d)
+{
+    if (d.isDict("preconditioner")) return d.subDict("preconditioner").get<word>("preconditioner");
+    return d.getOrDefault<word>("preconditioner", "none");
+}
+
+// Krylov preconditioner by OpenFOAM name: GAMG -> AMG, DIC / FDIC / DILU -> multi-colour DILU (the same
+// factorisation in colour order), diagonal -> Jacobi, none
+static gc::SolverCtl::Precond krylovPrecond(const fvMesh& mesh, const word& name, const dictionary& d)
+{
+    const word p = precondName(d);
+    if (p == "GAMG") return gc::SolverCtl::AMG;
+    if (p == "DIC" || p == "FDIC" || p == "DILU") return gc::SolverCtl::DILU;
+    if (p == "diagonal") return gc::SolverCtl::JACOBI;
+    if (p == "none") return gc::SolverCtl::NONE;
+    FatalErrorInFunction << mesh.name() << ": preconditioner " << p << " for " << name
+        << " is not supported (GAMG, DIC, FDIC, DILU, diagonal, none)" << exit(FatalError);
+    return gc::SolverCtl::NONE;
+}
+
+// log name prefix as OpenFOAM prints it (preconditioner type + solver type, e.g. DICPCG); AMG keeps "AMG"
+static std::string precondPrefix(gc::SolverCtl::Precond p, const char* ilu)
+{
+    switch (p)
+    {
+        case gc::SolverCtl::AMG: return "AMG";
+        case gc::SolverCtl::DILU: return ilu;
+        case gc::SolverCtl::JACOBI: return "diagonal";
+        default: return "none";
+    }
+}
+
+gc::SolverCtl readSolver(const fvMesh& mesh, const word& name, bool pressure)
 {
     const dictionary& d = mesh.solverDict(name);
     const word s = d.get<word>("solver");
@@ -257,20 +303,33 @@ gc::SolverCtl readSolver(const fvMesh& mesh, const word& name, bool pressure, bo
     else if (s == "PCG" || s == "PPCG" || s == "PPCR")
     {
         c.method = gc::SolverCtl::PCG;
-        c.precond = d.getOrDefault<word>("preconditioner", "DIC") == "GAMG" ? gc::SolverCtl::AMG : gc::SolverCtl::JACOBI;
-        c.name = s;
+        c.precond = krylovPrecond(mesh, name, d);
+        c.name = precondPrefix(c.precond, "DIC") + "PCG";
     }
     else if (s == "PBiCG" || s == "PBiCGStab")
     {
         c.method = gc::SolverCtl::PBICGSTAB;
-        c.precond = gc::SolverCtl::JACOBI;
-        c.name = "PBiCGStab";
+        c.precond = krylovPrecond(mesh, name, d);
+        c.name = precondPrefix(c.precond, "DILU") + "PBiCGStab";
     }
     else if (s == "smoothSolver")
     {
-        c.method = positive ? gc::SolverCtl::SMOOTH : gc::SolverCtl::PBICGSTAB;
-        c.precond = gc::SolverCtl::JACOBI;
-        c.name = positive ? "smoothSolver" : "PBiCGStab";
+        // smoothSolver: GaussSeidel / nonBlockingGaussSeidel (the same without processor boundaries),
+        // symGaussSeidel, DIC / DILU smoothers, all in the multi-colour order
+        const word sm = d.get<word>("smoother");
+        c.method = gc::SolverCtl::SMOOTH;
+        if (sm == "GaussSeidel" || sm == "nonBlockingGaussSeidel") c.smoother = gc::SolverCtl::GS;
+        else if (sm == "symGaussSeidel") c.smoother = gc::SolverCtl::SYMGS;
+        else if (sm == "DIC" || sm == "DILU") c.smoother = gc::SolverCtl::DILUSM;
+        else
+            FatalErrorInFunction << mesh.name() << ": smoother " << sm << " for " << name
+                << " is not supported (GaussSeidel, nonBlockingGaussSeidel, symGaussSeidel, DIC, DILU)"
+                << exit(FatalError);
+        c.nSweeps = d.getOrDefault<label>("nSweeps", 1);
+        if (c.nSweeps < 1)
+            FatalErrorInFunction << mesh.name() << ": nSweeps " << c.nSweeps << " for " << name
+                << " is not supported (>= 1)" << exit(FatalError);
+        c.name = "smoothSolver";
     }
     else
     {
@@ -288,6 +347,7 @@ EnergyCoupling::EnergyCoupling(Time& runTime, List<Region>& regions, const gc::M
     mi_(mi),
     E_(E),
     T_(regions.size()),
+    h_(regions.size()),
     pSolid_(regions.size()),
     solid_(regions.size()),
     fluid_(regions.size())
@@ -298,6 +358,8 @@ EnergyCoupling::EnergyCoupling(Time& runTime, List<Region>& regions, const gc::M
         fvMesh& mesh = *R_[r].mesh;
         T_.set(r, new volScalarField(IOobject("T", runTime.timeName(), mesh, IOobject::MUST_READ,
                                               IOobject::AUTO_WRITE), mesh));
+        h_.set(r, new volScalarField(IOobject("h", runTime.timeName(), mesh, IOobject::NO_READ,
+                                              IOobject::NO_WRITE), mesh, dimensionedScalar(dimEnergy/dimMass, Zero)));
         if (R_[r].fluid)
         {
             readFluidProps(r);
@@ -1121,6 +1183,7 @@ void EnergyCoupling::setupSchemes()
     forAll(R_, r)
     {
         const fvMesh& mesh = *R_[r].mesh;
+        requireEuler(mesh);
         limK[r] = gradLimitK(mesh, "grad(h)");
         psi[r] = laplacianPsi(mesh, R_[r].fluid ? "laplacian(alphaEff,h)" : "laplacian(alpha,h)");
         Info<< "    " << mesh.name() << ": grad(h) limiter " << limK[r] << ", laplacian psi " << psi[r] << endl;
@@ -1258,33 +1321,43 @@ void EnergyCoupling::updateBCs(bool initCall)
     }
     if (!hSources_.empty())
     {
-        std::vector<double> Su(mi_.nC, 0.0), Sp(mi_.nC, 0.0);
+        // the cell lists go to the device once; each update sends the source values only
+        if (hSet_ < 0)
+        {
+            std::vector<std::vector<int>> cl(hSources_.size());
+            std::vector<std::vector<double>> wl(hSources_.size());
+            forAll(hSources_, k)
+            {
+                cl[k] = hSources_[k].cells;
+                wl[k] = hSources_[k].wV;
+            }
+            hSet_ = E_.sourceSet(-1, -1, cl, wl);
+        }
+        std::vector<double> su(hSources_.size()), sp(hSources_.size());
         forAll(hSources_, k)
         {
             const SemiImplicitSource& s = hSources_[k];
-            const scalar su = s.SuF ? s.SuF->value(t) : s.SuConst;
-            const scalar sp = s.SpF ? s.SpF->value(t) : s.SpConst;
-            for (size_t i = 0; i < s.cells.size(); ++i)
-            {
-                Su[s.cells[i]] += su*s.wV[i];
-                Sp[s.cells[i]] += sp*s.wV[i];
-            }
+            su[k] = s.SuF ? s.SuF->value(t) : s.SuConst;
+            sp[k] = s.SpF ? s.SpF->value(t) : s.SpConst;
         }
-        E_.put(gc::A::Su, Su);
-        E_.put(gc::A::Sp, Sp);
+        E_.sourceValues(hSet_, su, sp);
     }
     if (!tConstraints_.empty())
     {
-        std::vector<int> cells;
         std::vector<double> vals;
         forAll(tConstraints_, k)
         {
             const FixedTempConstraint& ft = tConstraints_[k];
-            const double tv = ft.Tf->value(t);
-            cells.insert(cells.end(), ft.gcells.begin(), ft.gcells.end());
-            vals.insert(vals.end(), ft.gcells.size(), tv);
+            vals.insert(vals.end(), ft.gcells.size(), ft.Tf->value(t));
         }
-        E_.setFixedT(cells, vals);
+        if (vals != fixVals_)                 // upload only when the temperatures change
+        {
+            std::vector<int> cells;
+            forAll(tConstraints_, k)
+                cells.insert(cells.end(), tConstraints_[k].gcells.begin(), tConstraints_[k].gcells.end());
+            E_.setFixedT(cells, vals);
+            fixVals_ = vals;
+        }
     }
 }
 
@@ -1293,28 +1366,33 @@ void EnergyCoupling::updateSpecieSources(label r, int fluidId) const
     if (ySources_.empty()) return;
     const scalar t = runTime_.timeOutputValue();
     const FluidProps& fp = fluid_[r];
-    const label nc = R_[r].mesh->nCells();
     forAll(fp.species, m)
     {
         if (m == fp.inertIndex) continue;
-        bool any = false;
+        std::vector<label> ks;
         forAll(ySources_, k)
-            if (ySources_[k].region == r && ySources_[k].specie == m) { any = true; break; }
-        if (!any) continue;
-        std::vector<double> Su(nc, 0.0), Sp(nc, 0.0);
-        forAll(ySources_, k)
+            if (ySources_[k].region == r && ySources_[k].specie == m) ks.push_back(k);
+        if (ks.empty()) continue;
+        auto it = ySets_.find(std::make_pair(r, label(m)));
+        if (it == ySets_.end())
+        {
+            std::vector<std::vector<int>> cl;
+            std::vector<std::vector<double>> wl;
+            for (const label k : ks)
+            {
+                cl.push_back(ySources_[k].cells);
+                wl.push_back(ySources_[k].wV);
+            }
+            it = ySets_.emplace(std::make_pair(r, label(m)), E_.sourceSet(fluidId, m, cl, wl)).first;
+        }
+        std::vector<double> su, sp;
+        for (const label k : ks)
         {
             const SemiImplicitSource& s = ySources_[k];
-            if (s.region != r || s.specie != m) continue;
-            const scalar su = s.SuF ? s.SuF->value(t) : s.SuConst;
-            const scalar sp = s.SpF ? s.SpF->value(t) : s.SpConst;
-            for (size_t i = 0; i < s.cells.size(); ++i)
-            {
-                Su[s.cells[i]] += su*s.wV[i];
-                Sp[s.cells[i]] += sp*s.wV[i];
-            }
+            su.push_back(s.SuF ? s.SuF->value(t) : s.SuConst);
+            sp.push_back(s.SpF ? s.SpF->value(t) : s.SpConst);
         }
-        E_.fputSpecieSource(fluidId, m, Su, Sp);
+        E_.sourceValues(it->second, su, sp);
     }
 }
 
@@ -1340,16 +1418,31 @@ gc::SolverCtl EnergyCoupling::solverCtl(bool finalIter) const
 
 void EnergyCoupling::logMinMax() const
 {
+    // min(T) / max(T) as OpenFOAM prints them: cells and patch faces of the region
+    std::vector<double> mn, mx;
+    E_.energyMinMaxT(mn, mx);
     forAll(R_, r)
     {
-        double mn, mx;
-        E_.minMax(gc::A::T, R_[r].c0, R_[r].mesh->nCells(), mn, mx);
-        Info<< "Min/max T:" << mn << ' ' << mx << "  (" << R_[r].name << ")" << endl;
+        Info<< "Min/max T:" << mn[r] << ' ' << mx[r] << "  (" << R_[r].name << ")" << endl;
     }
 }
 
 scalar EnergyCoupling::solidDiffNo(scalar dt, scalar& meanDi) const
 {
+    // solidRegionDiffNo: max / average of sqr(deltaCoeffs) kappa/(rho Cp) dt; the solid properties are uniform
+    // and the mesh fixed, so the deltaCoeffs part is reduced once (max commutes exactly with the positive factor)
+    if (dc2Max_.size() != R_.size())
+    {
+        dc2Max_.setSize(R_.size(), 0.0);
+        dc2Avg_.setSize(R_.size(), 0.0);
+        forAll(R_, r)
+        {
+            if (R_[r].fluid) continue;
+            const surfaceScalarField dc2(sqr(R_[r].mesh->surfaceInterpolation::deltaCoeffs()));
+            dc2Max_[r] = max(dc2).value();
+            dc2Avg_[r] = average(dc2).value();
+        }
+    }
     scalar DiNum = -GREAT;
     meanDi = 0.0;
     forAll(R_, r)
@@ -1357,13 +1450,9 @@ scalar EnergyCoupling::solidDiffNo(scalar dt, scalar& meanDi) const
         if (R_[r].fluid) continue;
         const fvMesh& mesh = *R_[r].mesh;
         const SolidProps& s = solid_[r];
-        const dimensionedScalar alpha("alpha", sqr(dimLength)/dimTime, s.kappa/(s.rho*s.Cp));
-        const surfaceScalarField kapparhoCpbyDelta
-        (
-            sqr(mesh.surfaceInterpolation::deltaCoeffs())*alpha
-        );
-        const scalar diR = max(kapparhoCpbyDelta).value()*dt;
-        const scalar meanDiR = average(kapparhoCpbyDelta).value()*dt;
+        const scalar alpha = s.kappa/(s.rho*s.Cp);
+        const scalar diR = dc2Max_[r]*alpha*dt;
+        const scalar meanDiR = dc2Avg_[r]*alpha*dt;
         Info<< "Region: " << mesh.name() << " Diffusion Number mean: " << meanDiR
             << " max: " << diR << endl;
         DiNum = max(DiNum, diR);
@@ -1380,16 +1469,24 @@ void EnergyCoupling::writeBack()
     std::vector<double> TA, TB, gA, gB;
     E_.interfaceState(TA, TB, gA, gB);
     const std::vector<double> bv = E_.get(gc::A::bVal), bg = E_.get(gc::A::bGrad), bf = E_.get(gc::A::bVf);
+    const std::vector<double> cp = E_.get(gc::A::cp), ee = E_.get(gc::A::e);
+    const std::vector<double> cpB = E_.get(gc::A::cpB), eB = E_.get(gc::A::eB);
     forAll(R_, r)
     {
         scalarField& Ti = T_[r].primitiveFieldRef();
-        forAll(Ti, c) Ti[c] = Tc[R_[r].c0 + c];
+        scalarField& hi = h_[r].primitiveFieldRef();
+        forAll(Ti, c)
+        {
+            const label g = R_[r].c0 + c;
+            Ti[c] = Tc[g];
+            hi[c] = cp[g]*Tc[g] + ee[g];
+        }
     }
     for (const TPatch& tp : patches_)
     {
         if (tp.kind == TPatch::EMPTY || !tp.n) continue;
         fvPatchScalarField& pf = T_[tp.region].boundaryFieldRef()[tp.patch];
-        scalarField v(tp.n);
+        scalarField v(tp.n), hv(tp.n);
         if (tp.kind == TPatch::COUPLED)
         {
             const PatchMap& pm = R_[tp.region].patches[tp.patch];
@@ -1400,6 +1497,8 @@ void EnergyCoupling::writeBack()
                 const label j = pm.ifaceIdx[i];
                 const label f = pm.gface[i];
                 v[i] = A ? TA[j] : TB[j];
+                const label myCell = A ? mi_.own[f] : mi_.nei[f];
+                hv[i] = cp[myCell]*v[i] + ee[myCell];
                 const label nbrCell = A ? mi_.nei[f] : mi_.own[f];
                 const scalar mine = A ? gA[j] : gB[j], nbr = A ? gB[j] : gA[j];
                 mp.refValue()[i] = Tc[nbrCell];
@@ -1409,7 +1508,11 @@ void EnergyCoupling::writeBack()
         }
         else
         {
-            forAll(v, i) v[i] = Tb[tp.b0 + i];
+            forAll(v, i)
+            {
+                v[i] = Tb[tp.b0 + i];
+                hv[i] = cpB[tp.b0 + i]*v[i] + eB[tp.b0 + i];
+            }
             if (tp.kind == TPatch::MIXED || tp.kind == TPatch::INLETOUTLET || tp.kind == TPatch::EXTWALL
              || tp.kind == TPatch::EXTSURF)
             {
@@ -1423,6 +1526,7 @@ void EnergyCoupling::writeBack()
             }
         }
         pf == v;
+        h_[tp.region].boundaryFieldRef()[tp.patch] == hv;
     }
 }
 

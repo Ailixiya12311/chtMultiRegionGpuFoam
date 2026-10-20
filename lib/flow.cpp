@@ -59,10 +59,11 @@ FW fw(Flow& F)
     return v;
 }
 
-// cell-face entry of a flow cell: 0 region face (owner side), 1 region face (neighbour side), 2 boundary slot
-HD inline int ent(const FW& v, int e, int& j, int& other)
+// cell-face entry q of a flow cell: 0 region face (owner side), 1 region face (neighbour side), 2 boundary slot
+HD inline int ent(const FW& v, int q, int& j, int& other)
 {
     const MeshView& g = v.g;
+    const int e = g.cfEnt[q];
     if (e >= 0)
     {
         if (e < g.nI)
@@ -139,7 +140,7 @@ HD inline void uCoeffs(const FW& v, long s, const v3& UP, double a[3], double b[
 
 HD inline bool isPFixed(int pk)
 {
-    return pk == P_FIXED || pk == P_PRGH_P || pk == P_PRGH_TOTALP;
+    return pk == P_FIXED || pk == P_PRGH_P || pk == P_PRGH_TOTALP || pk == P_TOTALP;
 }
 
 HD inline double pSlot(const FW& v, long s, double pP)
@@ -284,6 +285,7 @@ HD inline void mixProps(int nSp, const double* spD, double Tref0, const double* 
 void lsGradient(const FW& v, const double* phi, int st, int off, const double* phib, int bst, int boff, double k,
                 double* out, int ost, int ooff, int dst)
 {
+    ProfScope prof("lsGradient");
     for_n(v.nc, [=] HD (long i) {
         const long c = v.c0 + i;
         const double hc = phi[i*st + off];
@@ -292,7 +294,7 @@ void lsGradient(const FW& v, const double* phi, int st, int off, const double* p
         for (int q = v.g.cfPtr[c]; q < v.g.cfPtr[c + 1]; ++q)
         {
             int j, o;
-            const int t = ent(v, v.g.cfEnt[q], j, o);
+            const int t = ent(v, q, j, o);
             double hv;
             if (t == 0) { hv = phi[long(o)*st + off]; gr += ld3(v.g.lsP, v.f0 + j)*(hv - hc); }
             else if (t == 1) { hv = phi[long(o)*st + off]; gr -= ld3(v.g.lsN, v.f0 + j)*(hc - hv); }
@@ -314,7 +316,7 @@ void lsGradient(const FW& v, const double* phi, int st, int off, const double* p
             for (int q = v.g.cfPtr[c]; q < v.g.cfPtr[c + 1]; ++q)
             {
                 int j, o;
-                const int t = ent(v, v.g.cfEnt[q], j, o);
+                const int t = ent(v, q, j, o);
                 const v3 Cf = t == 2 ? ld3(v.sCf, j) : ld3(v.g.Cf, v.f0 + j);
                 const double ex = dot(Cf - Cc, gr);
                 double r = 1.0;
@@ -327,6 +329,71 @@ void lsGradient(const FW& v, const double* phi, int st, int off, const double* p
         out[i*ost + ooff] = gr.x;
         out[i*ost + ooff + dst] = gr.y;
         out[i*ost + ooff + 2*dst] = gr.z;
+    });
+}
+
+// lsGradient of the three components of a vector field (U[3 i + k], slot values Ub[3 s + k]) in one pass over the
+// cell faces, each component with its own cellLimited limiter (as three lsGradient calls, same arithmetic):
+// out[9 i + k + 3 d] = d U_k / d x_d
+void lsGradient3(const FW& v, const double* phi, const double* phib, double k, double* out)
+{
+    ProfScope prof("lsGradient");
+    for_n(v.nc, [=] HD (long i) {
+        const long c = v.c0 + i;
+        const double hc[3] = {phi[3*i], phi[3*i + 1], phi[3*i + 2]};
+        v3 gr[3] = {V3(0, 0, 0), V3(0, 0, 0), V3(0, 0, 0)};
+        double mx[3] = {hc[0], hc[1], hc[2]}, mn[3] = {hc[0], hc[1], hc[2]};
+        for (int q = v.g.cfPtr[c]; q < v.g.cfPtr[c + 1]; ++q)
+        {
+            int j, o;
+            const int t = ent(v, q, j, o);
+            const double* hv = t == 2 ? phib + 3L*j : phi + 3L*o;
+            const v3 ls = t == 0 ? ld3(v.g.lsP, v.f0 + j) : (t == 1 ? ld3(v.g.lsN, v.f0 + j) : ld3(v.sLs, j));
+            for (int m = 0; m < 3; ++m)
+            {
+                if (t == 1) gr[m] -= ls*(hc[m] - hv[m]);
+                else gr[m] += ls*(hv[m] - hc[m]);
+                mx[m] = dmax(mx[m], hv[m]);
+                mn[m] = dmin(mn[m], hv[m]);
+            }
+        }
+        if (k > 0)
+        {
+            double maxD[3], minD[3], lim[3] = {1.0, 1.0, 1.0};
+            for (int m = 0; m < 3; ++m)
+            {
+                maxD[m] = mx[m] - hc[m];
+                minD[m] = mn[m] - hc[m];
+                if (k < 1)
+                {
+                    const double ext = (1.0/k - 1.0)*(maxD[m] - minD[m]);
+                    maxD[m] += ext;
+                    minD[m] -= ext;
+                }
+            }
+            const v3 Cc = ld3(v.g.C, c);
+            for (int q = v.g.cfPtr[c]; q < v.g.cfPtr[c + 1]; ++q)
+            {
+                int j, o;
+                const int t = ent(v, q, j, o);
+                const v3 dC = (t == 2 ? ld3(v.sCf, j) : ld3(v.g.Cf, v.f0 + j)) - Cc;
+                for (int m = 0; m < 3; ++m)
+                {
+                    const double ex = dot(dC, gr[m]);
+                    double r = 1.0;
+                    if (ex > SMALL) r = maxD[m]/ex;
+                    else if (ex < -SMALL) r = minD[m]/ex;
+                    lim[m] = dmin(lim[m], r);
+                }
+            }
+            for (int m = 0; m < 3; ++m) gr[m] = gr[m]*lim[m];
+        }
+        for (int m = 0; m < 3; ++m)
+        {
+            out[9*i + m] = gr[m].x;
+            out[9*i + m + 3] = gr[m].y;
+            out[9*i + m + 6] = gr[m].z;
+        }
     });
 }
 
@@ -492,6 +559,7 @@ void Flow::init(const DMesh& mesh, Energy& energy, int regionIndex, const std::v
     z(src3, 3L*nc); z(bD3, 3L*nc); z(bS3, 3L*nc); z(bMin, nc);
     z(rAU, nc); z(HbyA, 3L*nc); z(HbyAB, 3L*nS);
     z(rhorAUf, nf); z(rhorAUfB, nS); z(phiHbyA, nf); z(phiHbyAB, nS); z(phig, nf); z(phigB, nS); z(pCorr, nf);
+    z(wS, nS);
     MU.init(c0, nc, f0, nf);
     Mp.init(c0, nc, f0, nf);
     // reconstruct tensors: safeInv(sum over faces SfHat Sf)
@@ -505,7 +573,7 @@ void Flow::init(const DMesh& mesh, Energy& energy, int regionIndex, const std::v
             for (int q = v.g.cfPtr[c]; q < v.g.cfPtr[c + 1]; ++q)
             {
                 int j, o;
-                const int k = ent(v, v.g.cfEnt[q], j, o);
+                const int k = ent(v, q, j, o);
                 const v3 S = k == 2 ? ld3(v.sSf, j) : ld3(v.g.Sf, v.f0 + j);
                 const double r = 1.0/mag(S);
                 t[0] += S.x*S.x*r; t[1] += S.x*S.y*r; t[2] += S.x*S.z*r;
@@ -614,6 +682,11 @@ void Flow::updateRho()
             const v3 ub = ld3(v.Ub, s);
             v.pVal[s] = v.p0Val[s] - (v.phiB[s] < 0.0 ? 0.5*rb*dot(ub, ub) : 0.0) - rb*ghF(v, ld3(v.sCf, s));
         }
+        else if (pk == P_TOTALP)
+        {
+            const v3 ub = ld3(v.Ub, s);
+            v.pVal[s] = v.p0Val[s] - (v.phiB[s] < 0.0 ? 0.5*rb*dot(ub, ub) : 0.0);
+        }
     });
 }
 
@@ -686,6 +759,8 @@ void Flow::updateBoundary(bool evalFlowPatches)
         else if (pk == P_PRGH_TOTALP)
             v.pVal[s] = v.p0Val[s] - (v.phiB[s] < 0.0 ? 0.5*v.rhoB[s]*dot(ub, ub) : 0.0)
                         - v.rhoB[s]*ghF(v, ld3(v.sCf, s));
+        else if (pk == P_TOTALP)
+            v.pVal[s] = v.p0Val[s] - (v.phiB[s] < 0.0 ? 0.5*v.rhoB[s]*dot(ub, ub) : 0.0);
     });
 }
 
@@ -928,7 +1003,7 @@ void Flow::storeOld(double dt, bool frozen, bool storePrevIter)
             for (int q = v.g.cfPtr[c]; q < v.g.cfPtr[c + 1]; ++q)
             {
                 int j, o;
-                const int t = ent(v, v.g.cfEnt[q], j, o);
+                const int t = ent(v, q, j, o);
                 d += t == 0 ? v.phi[j] : (t == 1 ? -v.phi[j] : v.phiB[j]);
             }
             v.rho[i] = v.rho0f[i] - dt*d/v.g.V[c];
@@ -939,23 +1014,30 @@ void Flow::storeOld(double dt, bool frozen, bool storePrevIter)
 // ============================================================================================ UEqn.H
 void Flow::momentum(double dt, double alpha, const SolverCtl& ctl, bool predictor, SolveInfo info[3])
 {
+    ProfScope prof("momentum");
     FW v = fw(*this);
     const MeshView g = v.g;
-    updateBoundary();
+    { ProfScope pb("updateBoundary"); updateBoundary(); }
     // grad(U) with the grad(U) scheme (used by linearUpwind, dev2 and the laplacian correction)
-    for (int k = 0; k < 3; ++k) lsGradient(v, v.U, 3, k, v.Ub, 3, k, limitKU, v.gU, 9, k, 3);
+    lsGradient3(v, v.U, v.Ub, limitKU, v.gU);
     LduView L = view(MU);
     const double psi = psiU;
     const int cv = conv;
     const bool bnd = bounded;
+    std::unique_ptr<ProfScope> pa(new ProfScope("assemble"));
+    // face terms once per face (the cell rows gather them): laplacian coefficient and the explicit fluxes X, kept
+    // in face arrays that pressure() sets before it uses them
+    double *fg = v.pCorr, *fx0 = v.phig, *fx1 = v.phiHbyA, *fx2 = v.rhorAUf;
     for_n(nf, [=] HD (long j) {
         const long f = v.f0 + j;
-        const double w = g.w[f];
         const int o = g.own[f] - v.c0, n = g.nei[f] - v.c0;
-        const double gmag = (w*muEffC(v, o) + (1 - w)*muEffC(v, n))*g.magSf[f]*g.nonOrthDC[f];
-        const double F = v.phi[j];
-        L.upper[j] = -gmag + (F < 0 ? F : 0.0);
-        L.lower[j] = -gmag - (F > 0 ? F : 0.0);
+        const UFace u = uFace(v, j, o, n, psi, cv);
+        L.upper[j] = -u.gmag + (u.F < 0 ? u.F : 0.0);
+        L.lower[j] = -u.gmag - (u.F > 0 ? u.F : 0.0);
+        fg[j] = u.gmag;
+        fx0[j] = u.X[0];
+        fx1[j] = u.X[1];
+        fx2[j] = u.X[2];
     });
     const double rdt = dt > 0 ? 1.0/dt : 0.0;
     for_n(nc, [=] HD (long i) {
@@ -967,21 +1049,22 @@ void Flow::momentum(double dt, double alpha, const SolverCtl& ctl, bool predicto
         for (int q = g.cfPtr[c]; q < g.cfPtr[c + 1]; ++q)
         {
             int j, o;
-            const int t = ent(v, g.cfEnt[q], j, o);
+            const int t = ent(v, q, j, o);
             if (t == 0 || t == 1)
             {
-                const UFace u = t == 0 ? uFace(v, j, int(i), o, psi, cv) : uFace(v, j, o, int(i), psi, cv);
+                const double F = v.phi[j];
+                const double X[3] = {fx0[j], fx1[j], fx2[j]};
                 if (t == 0)
                 {
-                    D += u.gmag + (u.F > 0 ? u.F : 0.0);
-                    divPhi += u.F;
-                    for (int k = 0; k < 3; ++k) S[k] += u.X[k];
+                    D += fg[j] + (F > 0 ? F : 0.0);
+                    divPhi += F;
+                    for (int k = 0; k < 3; ++k) S[k] += X[k];
                 }
                 else
                 {
-                    D += u.gmag - (u.F < 0 ? u.F : 0.0);
-                    divPhi -= u.F;
-                    for (int k = 0; k < 3; ++k) S[k] -= u.X[k];
+                    D += fg[j] - (F < 0 ? F : 0.0);
+                    divPhi -= F;
+                    for (int k = 0; k < 3; ++k) S[k] -= X[k];
                 }
             }
             else
@@ -1041,16 +1124,18 @@ void Flow::momentum(double dt, double alpha, const SolverCtl& ctl, bool predicto
             v.bS3[3*i + k] = bS[k];
         }
     });
+    pa.reset();
     // UEqn.relax() (vector: patch coefficients enter with their largest magnitude and leave with the smallest)
     if (alpha > 0)
     {
+        ProfScope pr("relax");
         for_n(nc, [=] HD (long i) {
             const long c = v.c0 + i;
             double sumOff = 0;
             for (int q = g.cfPtr[c]; q < g.cfPtr[c + 1]; ++q)
             {
                 int j, o;
-                const int t = ent(v, g.cfEnt[q], j, o);
+                const int t = ent(v, q, j, o);
                 if (t == 0) sumOff += fabs(L.upper[j]);
                 else if (t == 1) sumOff += fabs(L.lower[j]);
             }
@@ -1067,24 +1152,33 @@ void Flow::momentum(double dt, double alpha, const SolverCtl& ctl, bool predicto
     for (int k = 0; k < 3; ++k) info[k] = SolveInfo();
     if (!predictor) return;
     // solve(UEqn == reconstruct((-ghf snGrad(rho) - snGrad(p_rgh)) magSf))
+    ProfScope pr("predictor");
     {
         // slot values of p_rgh and rho for the gradients
-        dvec<double> pb(nS);
-        double* pbp = ptr(pb);
+        double* pbp = ptr(wS);
         for_n(nS, [=] HD (long s) { pbp[s] = pSlot(v, s, v.p[v.sCell[s]]); });
         lsGradient(v, v.p, 1, 0, pbp, 1, 0, 0.0, v.gP, 3, 0, 1);
     }
     lsGradient(v, v.rho, 1, 0, v.rhoB, 1, 0, 0.0, v.gRho, 3, 0, 1);
-    dvec<double> rec(3L*nc);
-    double* rc = ptr(rec);
+    // reconstruct(...) V into HbyA (free here: pressure() sets it before use)
+    double* rc = v.HbyA;
     const double sP = psiSnP, sR = psiSnRho;
+    std::unique_ptr<ProfScope> pc(new ProfScope("reconstruct"));
+    // face values once per face (owner -> neighbour orientation, the same seen from both cells)
+    double* ff = v.pCorr;
+    for_n(nf, [=] HD (long j) {
+        const long f = v.f0 + j;
+        const int o = g.own[f] - v.c0, n = g.nei[f] - v.c0;
+        ff[j] = (-ghF(v, ld3(g.Cf, f))*snGradFace(v, j, o, n, v.rho, v.gRho, sR)
+                 - snGradFace(v, j, o, n, v.p, v.gP, sP))*g.magSf[f];
+    });
     for_n(nc, [=] HD (long i) {
         const long c = v.c0 + i;
         v3 sum = V3(0, 0, 0);
         for (int q = g.cfPtr[c]; q < g.cfPtr[c + 1]; ++q)
         {
             int j, o;
-            const int t = ent(v, g.cfEnt[q], j, o);
+            const int t = ent(v, q, j, o);
             double Ff;
             v3 S;
             if (t == 2)
@@ -1096,11 +1190,8 @@ void Flow::momentum(double dt, double alpha, const SolverCtl& ctl, bool predicto
             }
             else
             {
-                const long f = v.f0 + j;
-                const int oo = t == 0 ? int(i) : o, nn = t == 0 ? o : int(i);
-                S = ld3(g.Sf, f);
-                Ff = (-ghF(v, ld3(g.Cf, f))*snGradFace(v, j, oo, nn, v.rho, v.gRho, sR)
-                      - snGradFace(v, j, oo, nn, v.p, v.gP, sP))*g.magSf[f];
+                S = ld3(g.Sf, v.f0 + j);
+                Ff = ff[j];
             }
             sum += S*(Ff/mag(S));
         }
@@ -1110,8 +1201,9 @@ void Flow::momentum(double dt, double alpha, const SolverCtl& ctl, bool predicto
         rc[3*i + 1] = r.y*V;
         rc[3*i + 2] = r.z*V;
     });
-    dvec<double> x(nc);
-    double* xp = ptr(x);
+    pc.reset();
+    // component field into rAU (free here as HbyA)
+    double* xp = v.rAU;
     double* bd = ptr(MU.bDiag);
     double* bs = ptr(MU.bSrc);
     double* sr = ptr(MU.src);
@@ -1127,14 +1219,18 @@ void Flow::momentum(double dt, double alpha, const SolverCtl& ctl, bool predicto
         info[k] = solve(*m, MU, xp, ctl);
         for_n(nc, [=] HD (long i) { v.U[3*i + k] = xp[i]; });
     }
+    ProfScope pb("updateBoundary");
     updateBoundary();
 }
 
 // ============================================================================================ pEqn.H
-void Flow::pressure(double dt, const SolverCtl& ctl, double pRelax, int nNonOrth, SolveInfo& info, double contErr[2])
+void Flow::pressure(double dt, const SolverCtl& ctl, double pRelax, int nNonOrth, SolveInfo& info, double contErr[2],
+                    bool sameRho)
 {
+    ProfScope prof("pressure");
     FW v = fw(*this);
     const MeshView g = v.g;
+    std::unique_ptr<ProfScope> ps(new ProfScope("HbyA, phiHbyA"));
     updateRho();                                      // rho = thermo.rho()
     LduView LU = view(MU);
     // rAU = 1/A, HbyA = rAU H (A and H with the component-averaged patch diagonal)
@@ -1147,7 +1243,7 @@ void Flow::pressure(double dt, const SolverCtl& ctl, double pRelax, int nNonOrth
         for (int q = g.cfPtr[c]; q < g.cfPtr[c + 1]; ++q)
         {
             int j, o;
-            const int t = ent(v, g.cfEnt[q], j, o);
+            const int t = ent(v, q, j, o);
             if (t == 0) for (int k = 0; k < 3; ++k) H[k] -= LU.upper[j]*v.U[3*long(o) + k];
             else if (t == 1) for (int k = 0; k < 3; ++k) H[k] -= LU.lower[j]*v.U[3*long(o) + k];
         }
@@ -1159,8 +1255,8 @@ void Flow::pressure(double dt, const SolverCtl& ctl, double pRelax, int nNonOrth
         const int P = v.sCell[s];
         for (int k = 0; k < 3; ++k) v.HbyAB[3*s + k] = v.uAssign[s] ? v.HbyA[3*long(P) + k] : v.Ub[3*s + k];
     });
-    // grad(rho) for the limited snGrad(rho) of phig
-    lsGradient(v, v.rho, 1, 0, v.rhoB, 1, 0, 0.0, v.gRho, 3, 0, 1);
+    // grad(rho) for the limited snGrad(rho) of phig (unchanged at the next corrector: same T, so the same rho)
+    if (!sameRho) lsGradient(v, v.rho, 1, 0, v.rhoB, 1, 0, 0.0, v.gRho, 3, 0, 1);
     const double rdt = 1.0/dt;
     const double sR = psiSnRho;
     for_n(nf, [=] HD (long j) {
@@ -1198,17 +1294,18 @@ void Flow::pressure(double dt, const SolverCtl& ctl, double pRelax, int nNonOrth
         if (v.pKind[s] == P_FLUX)
             v.pGrad[s] = (v.phiHbyAB[s] - v.rhoB[s]*dot(ld3(v.Ub, s), S))/(v.sMagSf[s]*rf);
     });
+    ps.reset();
     // p_rgh equation
     LduView L = view(Mp);
     const double psi = psiP;
     const int ref = pRefCell;
     const double refV = pRefValue;
-    dvec<double> pbv(nS);
-    double* pb = ptr(pbv);
+    double* pb = ptr(wS);
     for (int corr = 0; corr <= nNonOrth; ++corr)
     {
         for_n(nS, [=] HD (long s) { pb[s] = pSlot(v, s, v.p[v.sCell[s]]); });
         lsGradient(v, v.p, 1, 0, pb, 1, 0, 0.0, v.gP, 3, 0, 1);
+        ps.reset(new ProfScope("assemble"));
         for_n(nf, [=] HD (long j) {
             const long f = v.f0 + j;
             const int o = g.own[f] - v.c0, n = g.nei[f] - v.c0;
@@ -1236,7 +1333,7 @@ void Flow::pressure(double dt, const SolverCtl& ctl, double pRelax, int nNonOrth
             for (int q = g.cfPtr[c]; q < g.cfPtr[c + 1]; ++q)
             {
                 int j, o;
-                const int t = ent(v, g.cfEnt[q], j, o);
+                const int t = ent(v, q, j, o);
                 if (t == 0)
                 {
                     D -= L.upper[j];
@@ -1275,9 +1372,11 @@ void Flow::pressure(double dt, const SolverCtl& ctl, double pRelax, int nNonOrth
             L.bAbs[i] = fabs(bD);
             L.bSrc[i] = bS;
         });
+        ps.reset();
         info = solve(*m, Mp, v.p, ctl, &amgP);
     }
     // phi = phiHbyA + p_rghEqn.flux()
+    ProfScope pu("flux, U, continuity");
     for_n(nf, [=] HD (long j) {
         const long f = v.f0 + j;
         const int o = g.own[f] - v.c0, n = g.nei[f] - v.c0;
@@ -1294,14 +1393,22 @@ void Flow::pressure(double dt, const SolverCtl& ctl, double pRelax, int nNonOrth
     // p_rgh.relax() (towards prevIter, stored at the start of the time step)
     if (pRelax > 0)
         for_n(nc, [=] HD (long i) { v.p[i] = v.pPrev[i] + pRelax*(v.p[i] - v.pPrev[i]); });
-    // U = HbyA + rAU reconstruct((phig + p_rghEqn.flux())/rhorAUf)  [flux() after p_rgh.relax()]
+    // U = HbyA + rAU reconstruct((phig + p_rghEqn.flux())/rhorAUf)  [flux() after p_rgh.relax()]; the face values
+    // once per face into phiHbyA (no longer needed)
+    double* ff = v.phiHbyA;
+    for_n(nf, [=] HD (long j) {
+        const long f = v.f0 + j;
+        const int o = g.own[f] - v.c0, n = g.nei[f] - v.c0;
+        const double fl = L.upper[j]*(v.p[n] - v.p[o]) - v.pCorr[j];
+        ff[j] = (v.phig[j] + fl)/v.rhorAUf[j];
+    });
     for_n(nc, [=] HD (long i) {
         const long c = v.c0 + i;
         v3 sum = V3(0, 0, 0);
         for (int q = g.cfPtr[c]; q < g.cfPtr[c + 1]; ++q)
         {
             int j, o;
-            const int t = ent(v, g.cfEnt[q], j, o);
+            const int t = ent(v, q, j, o);
             v3 S;
             double Ff;
             if (t == 2)
@@ -1316,11 +1423,8 @@ void Flow::pressure(double dt, const SolverCtl& ctl, double pRelax, int nNonOrth
             }
             else
             {
-                const long f = v.f0 + j;
-                const int oo = t == 0 ? int(i) : o, nn = t == 0 ? o : int(i);
-                S = ld3(g.Sf, f);
-                const double fl = L.upper[j]*(v.p[nn] - v.p[oo]) - v.pCorr[j];
-                Ff = (v.phig[j] + fl)/v.rhorAUf[j];
+                S = ld3(g.Sf, v.f0 + j);
+                Ff = ff[j];
             }
             sum += S*(Ff/mag(S));
         }
@@ -1334,15 +1438,15 @@ void Flow::pressure(double dt, const SolverCtl& ctl, double pRelax, int nNonOrth
     // rhoEqn + compressibleContinuityErrors: rho from continuity against the thermodynamic rho
     {
         double tot = 0, sl = 0, gl = 0;
-        dvec<double> rc(nc);
-        double* r = ptr(rc);
+        double* r = v.rAU;                            // free after the U reconstruction above
+
         for_n(nc, [=] HD (long i) {
             const long c = v.c0 + i;
             double d = 0;
             for (int q = g.cfPtr[c]; q < g.cfPtr[c + 1]; ++q)
             {
                 int j, o;
-                const int t = ent(v, g.cfEnt[q], j, o);
+                const int t = ent(v, q, j, o);
                 d += t == 0 ? v.phi[j] : (t == 1 ? -v.phi[j] : v.phiB[j]);
             }
             r[i] = v.rho0f[i] - dt*d/g.V[c];
@@ -1412,7 +1516,7 @@ void Flow::toEnergy(double dt, bool dpdtOn)
         for (int q = g.cfPtr[c]; q < g.cfPtr[c + 1]; ++q)
         {
             int j, o;
-            const int t = ent(v, g.cfEnt[q], j, o);
+            const int t = ent(v, q, j, o);
             if (t == 2)
             {
                 const v3 ub = ld3(v.Ub, j);
@@ -1455,6 +1559,7 @@ void Flow::toEnergy(double dt, bool dpdtOn)
 void Flow::turbulence(double dt, double alphaK, double alphaEps, const SolverCtl& ctlK, const SolverCtl& ctlEps,
                       SolveInfo& infoEps, SolveInfo& infoK)
 {
+    ProfScope prof("turbulence");
     infoEps = SolveInfo();
     infoK = SolveInfo();
     if (!turb.enabled) return;
@@ -1466,8 +1571,9 @@ void Flow::turbulence(double dt, double alphaK, double alphaEps, const SolverCtl
     double *kbp = ptr(kb), *ebp = ptr(epsb);
     const int *kK = ptr(kKind), *eK = ptr(epsKind);
     const double *kV = ptr(kVal), *eV = ptr(epsVal);
-    for (int d = 0; d < 3; ++d) lsGradient(v, v.U, 3, d, v.Ub, 3, d, limitKU, v.gU, 9, d, 3);
+    lsGradient3(v, v.U, v.Ub, limitKU, v.gU);
     double *gbynu = ptr(GbyNu), *gturb = ptr(Gturb), *divu = ptr(divU);
+    std::unique_ptr<ProfScope> pg(new ProfScope("G, divU, wall"));
     for_n(nc, [=] HD (long i) {
         const double* G = v.gU + 9*i;
         const double tr2 = (2.0/3.0)*(G[0] + G[4] + G[8]);
@@ -1485,7 +1591,7 @@ void Flow::turbulence(double dt, double alphaK, double alphaEps, const SolverCtl
         for (int q = g.cfPtr[c]; q < g.cfPtr[c + 1]; ++q)
         {
             int j, o;
-            const int t = ent(v, g.cfEnt[q], j, o);
+            const int t = ent(v, q, j, o);
             if (t == 2)
             {
                 dv += v.phiB[j]/v.rhoB[j];
@@ -1520,7 +1626,7 @@ void Flow::turbulence(double dt, double alphaK, double alphaEps, const SolverCtl
             for (int q = g.cfPtr[c]; q < g.cfPtr[c + 1]; ++q)
             {
                 int j, o;
-                const int t = ent(v, g.cfEnt[q], j, o);
+                const int t = ent(v, q, j, o);
                 if (t != 2 || !isw[j]) continue;
                 const long s = j;
                 const double w = cw[s];
@@ -1536,6 +1642,7 @@ void Flow::turbulence(double dt, double alphaK, double alphaEps, const SolverCtl
             gturb[i] = g0;
         });
     }
+    pg.reset();
 
     LduView L = view(Mp);
     double* corr = ptr(pCorr);
@@ -1557,6 +1664,7 @@ void Flow::turbulence(double dt, double alphaK, double alphaEps, const SolverCtl
         for_n(nc, [=] HD (long i) { de[i] = v.rho[i]*v.nut[i]*invSig + v.mu[i]; });
         for_n(nS, [=] HD (long s) { deb[s] = v.rhoB[s]*v.nutB[s]*invSig + v.muB[s]; });
         if (psi > 0.0 || cv == 1 || cv == 3) lsGradient(v, fld, 1, 0, fldb, 1, 0, limK, gp, 3, 0, 1);
+        std::unique_ptr<ProfScope> pa(new ProfScope("assemble"));
         for_n(nf, [=] HD (long j) {
             const long f = v.f0 + j;
             const int o = g.own[f] - v.c0, n = g.nei[f] - v.c0;
@@ -1602,7 +1710,7 @@ void Flow::turbulence(double dt, double alphaK, double alphaEps, const SolverCtl
             for (int q = g.cfPtr[c]; q < g.cfPtr[c + 1]; ++q)
             {
                 int j, o;
-                const int t = ent(v, g.cfEnt[q], j, o);
+                const int t = ent(v, q, j, o);
                 if (t == 0)
                 {
                     D -= L.lower[j];
@@ -1672,7 +1780,7 @@ void Flow::turbulence(double dt, double alphaK, double alphaEps, const SolverCtl
                 for (int q = g.cfPtr[c]; q < g.cfPtr[c + 1]; ++q)
                 {
                     int j, o;
-                    const int t = ent(v, g.cfEnt[q], j, o);
+                    const int t = ent(v, q, j, o);
                     if (t == 0) sumOff += fabs(L.upper[j]);
                     else if (t == 1) sumOff += fabs(L.lower[j]);
                 }
@@ -1684,7 +1792,9 @@ void Flow::turbulence(double dt, double alphaK, double alphaEps, const SolverCtl
         }
         if (isEps && !wallCellsGlobal.empty())
             setValues(*this->m, Mp, wallCellsGlobal, epsWall, fld);
+        pa.reset();
         info = solve(*this->m, Mp, fld, ctl);
+        ProfScope pb("bound");
         const double vmin = isEps ? turb.epsMin : turb.kMin;
         const double mn = min_n(nc, [=] HD (long i) { return fld[i]; });
         if (mn < vmin)
@@ -1702,7 +1812,7 @@ void Flow::turbulence(double dt, double alphaK, double alphaEps, const SolverCtl
                 for (int q = g.cfPtr[c]; q < g.cfPtr[c + 1]; ++q)
                 {
                     int j, o;
-                    const int t = ent(v, g.cfEnt[q], j, o);
+                    const int t = ent(v, q, j, o);
                     if (t == 2)
                     {
                         const double ms = v.sMagSf[j];
@@ -1742,6 +1852,7 @@ void Flow::turbulence(double dt, double alphaK, double alphaEps, const SolverCtl
 // ============================================================================================ YEqn.H
 void Flow::species(double dt, const std::vector<double>& alphaY, const SolverCtl& ctl, std::vector<SolveInfo>& info)
 {
+    ProfScope prof("species");
     info.assign(nSp, SolveInfo());
     if (nSp <= 0) return;
     FW v = fw(*this);
@@ -1857,7 +1968,7 @@ void Flow::species(double dt, const std::vector<double>& alphaY, const SolverCtl
             for (int q = g.cfPtr[c]; q < g.cfPtr[c + 1]; ++q)
             {
                 int j, o;
-                const int t = ent(v, g.cfEnt[q], j, o);
+                const int t = ent(v, q, j, o);
                 if (t == 0)
                 {
                     D -= L.lower[j];
@@ -1910,7 +2021,7 @@ void Flow::species(double dt, const std::vector<double>& alphaY, const SolverCtl
                 for (int q = g.cfPtr[c]; q < g.cfPtr[c + 1]; ++q)
                 {
                     int j, o;
-                    const int t = ent(v, g.cfEnt[q], j, o);
+                    const int t = ent(v, q, j, o);
                     if (t == 0) sumOff += fabs(L.upper[j]);
                     else if (t == 1) sumOff += fabs(L.lower[j]);
                 }
@@ -1958,7 +2069,7 @@ double Flow::courantNo(double dt, double& meanCo)
         for (int q = g.cfPtr[c]; q < g.cfPtr[c + 1]; ++q)
         {
             int j, o;
-            const int t = ent(v, g.cfEnt[q], j, o);
+            const int t = ent(v, q, j, o);
             if (t == 0 || t == 1) sp += fabs(v.phi[j]);
             else if (t == 2) sp += fabs(v.phiB[j]);
         }
@@ -1970,7 +2081,7 @@ double Flow::courantNo(double dt, double& meanCo)
         for (int q = g.cfPtr[c]; q < g.cfPtr[c + 1]; ++q)
         {
             int j, o;
-            const int t = ent(v, g.cfEnt[q], j, o);
+            const int t = ent(v, q, j, o);
             if (t == 0 || t == 1) sp += fabs(v.phi[j]);
             else if (t == 2) sp += fabs(v.phiB[j]);
         }

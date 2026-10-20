@@ -1,5 +1,5 @@
 #!/bin/bash
-# Sync lib/ test/ app/ verify/ tools/ README.md to the NAS work dir and run a command in the isolated OpenFOAM container.
+# Sync lib/ test/ app/ verify/ tools/ README.md Allwmake Allwclean to the NAS work dir and run a command in the isolated OpenFOAM container.
 #   tools/nas.sh 'cd /w/lib && make BACKEND=omp test'        (from Git Bash on the Windows machine)
 # CPUS / MEM env override the container limits (default 6 cores, 8 GB).
 # Host, key and paths come from tools/nas.env (not committed; copy tools/nas.env.example).
@@ -10,7 +10,7 @@ P="$(cd "$(dirname "$0")/.." && pwd)"
 W=$NAS_WORK/gpu_cht_of_r1
 K="-i $NAS_KEY -o IdentitiesOnly=yes -o BatchMode=yes"
 T=$(mktemp -u /tmp/gcof_XXXX).tar
-(cd "$P" && tar cf "$T" --exclude=tools/nas.env $(ls -d lib test app verify tools README.md 2>/dev/null))
+(cd "$P" && tar cf "$T" --exclude=tools/nas.env $(ls -d lib test app verify tools README.md Allwmake Allwclean 2>/dev/null))
 scp $K "$T" $NAS_HOST:/tmp/gcof_sync.tar >/dev/null
 rm -f "$T"
 ssh $K $NAS_HOST "cd $W && tar xf /tmp/gcof_sync.tar && chown -R 65532:65532 $W && \

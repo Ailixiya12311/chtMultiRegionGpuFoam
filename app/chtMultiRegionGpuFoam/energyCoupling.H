@@ -21,6 +21,9 @@
 #include "Function1.H"
 #include "PatchFunction1.H"
 
+#include <map>
+#include <vector>
+
 namespace Foam
 {
 
@@ -166,13 +169,21 @@ private:
     const gc::MeshIn& mi_;
     gc::Engine& E_;
     PtrList<volScalarField> T_;
+    // he = cp T + e of the device, registered as "h" (not written) for functionObjects (solverInfo needs the
+    // field to report the h solve, probes / sample can read it)
+    PtrList<volScalarField> h_;
     PtrList<volScalarField> pSolid_;
     List<SolidProps> solid_;
+    // per solid region max and average of sqr(deltaCoeffs) over the internal faces (fixed mesh), for solidDiffNo
+    mutable List<scalar> dc2Max_, dc2Avg_;
     List<FluidProps> fluid_;
     List<TPatch> patches_;
     PtrList<SemiImplicitSource> hSources_;
     PtrList<SemiImplicitSource> ySources_;
     PtrList<FixedTempConstraint> tConstraints_;
+    int hSet_ = -1;                                       // device source set of hSources_
+    mutable std::map<std::pair<label, label>, int> ySets_;   // (region, specie) -> device source set
+    std::vector<double> fixVals_;                         // fixedTemperatureConstraint values on the device
     bool hasBuilding_ = false;
     label nZones_ = 0;
     PtrList<RadSource> radSources_;
@@ -199,7 +210,9 @@ scalar gradLimitK(const fvMesh& mesh, const word& name);
 // returns 0 upwind, 1 linearUpwind, 2 linear, 3 limitedLinear (k in coef); allowed: bit mask of accepted kinds
 int divScheme(const fvMesh& mesh, const word& name, const word& field, int allowed, bool& bounded, scalar& coef);
 // fvSolution solver entry -> device solver settings (Py version mapping)
-gc::SolverCtl readSolver(const fvMesh& mesh, const word& name, bool pressure, bool positive = false);
+gc::SolverCtl readSolver(const fvMesh& mesh, const word& name, bool pressure);
+// the time discretisation is Euler throughout: any other ddtSchemes entry stops with an error
+void requireEuler(const fvMesh& mesh);
 
 } // namespace gpuCht
 } // namespace Foam

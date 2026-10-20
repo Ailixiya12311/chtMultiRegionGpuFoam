@@ -123,10 +123,9 @@ void setValues(const DMesh& m, Ldu& M, const dvec<int>& cells, const dvec<double
     const MeshView g = view(m);
     LduView L = view(M);
     const int c0 = L.c0, f0 = L.f0, f1 = L.f0 + L.nf, nI = g.nI;
-    // marker: value per constrained cell (NaN elsewhere)
-    dvec<double> mark(L.nc);
-    fill(mark, double(NAN));
-    double* mk = ptr(mark);
+    // marker: value per constrained cell (NaN elsewhere), in a linear-solver work slot (free until the solve)
+    double* mk = m.workBuf(DMesh::nWork - 1, L.nc);
+    for_n(L.nc, [=] HD (long i) { mk[i] = double(NAN); });
     const int* cl = ptr(cells);
     const double* vl = ptr(values);
     for_n(n, [=] HD (long j) { mk[cl[j] - c0] = vl[j]; });

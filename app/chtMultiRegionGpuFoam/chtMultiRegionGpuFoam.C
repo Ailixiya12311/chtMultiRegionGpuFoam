@@ -20,7 +20,57 @@ Description
 #include "fluidCoupling.H"
 #include "api.h"
 
+#include <chrono>
+
 using namespace Foam;
+
+// wall time per phase of the time loop (device synchronised at each mark), summarised at the end
+class PhaseTimer
+{
+    const gc::Engine& e_;
+    std::chrono::steady_clock::time_point t0_ = std::chrono::steady_clock::now();
+    DynamicList<word> names_;
+    DynamicList<scalar> secs_;
+
+public:
+    explicit PhaseTimer(const gc::Engine& e) : e_(e) {}
+
+    void reset()
+    {
+        e_.sync();
+        t0_ = std::chrono::steady_clock::now();
+    }
+
+    // time since the previous mark goes to phase `name`
+    void mark(const word& name)
+    {
+        e_.sync();
+        const auto t = std::chrono::steady_clock::now();
+        const scalar s = std::chrono::duration<double>(t - t0_).count();
+        t0_ = t;
+        label i = names_.find(name);
+        if (i < 0)
+        {
+            names_.append(name);
+            secs_.append(0);
+            i = names_.size() - 1;
+        }
+        secs_[i] += s;
+    }
+
+    void report(label nSteps) const
+    {
+        scalar total = 0;
+        forAll(secs_, i) total += secs_[i];
+        Info<< "Time loop wall time by phase (" << nSteps << " steps, " << total << " s):" << nl;
+        forAll(names_, i)
+        {
+            Info<< "    " << names_[i].c_str() << ": " << secs_[i] << " s, "
+                << secs_[i]/max(nSteps, label(1)) << " s/step, " << 100*secs_[i]/max(total, VSMALL) << " %" << nl;
+        }
+        Info<< endl;
+    }
+};
 
 int main(int argc, char *argv[])
 {
@@ -81,13 +131,14 @@ int main(int argc, char *argv[])
     gpuCht::FluidCoupling fluids(runTime, regions, mi, engine, energy, nOuterCorr);
     Info<< "device memory after the fields: " << engine.memGB() << " GB" << nl << endl;
 
-    if (adjustTimeStep)
+    // compressibleMultiRegionCourantNo.H and solidRegionDiffusionNo.H run (and print) whether or not the time step
+    // is adjusted; then setInitialMultiRegionDeltaT.H
     {
         const scalar dt0 = runTime.deltaTValue();
         scalar meanCo = 0, meanDi = 0;
         scalar CoNum = fluids.courantNo(dt0, meanCo);
         scalar DiNum = energy.solidDiffNo(dt0, meanDi);
-        if ((runTime.timeIndex() == 0) && ((CoNum > SMALL) || (DiNum > SMALL)))
+        if (adjustTimeStep && (runTime.timeIndex() == 0) && ((CoNum > SMALL) || (DiNum > SMALL)))
         {
             if (CoNum < SMALL) CoNum = SMALL;
             if (DiNum < SMALL) DiNum = SMALL;
@@ -105,14 +156,21 @@ int main(int argc, char *argv[])
 
     Info<< "\nStarting time loop\n" << endl;
 
+    PhaseTimer timer(engine);
+    label nSteps = 0;
+    timer.reset();
+
     while (runTime.run())
     {
+        timer.mark("functionObjects");
+
+        // compressibleMultiRegionCourantNo.H, solidRegionDiffusionNo.H (always), setMultiRegionDeltaT.H
+        const scalar dt0 = runTime.deltaTValue();
+        scalar meanCo = 0, meanDi = 0;
+        scalar CoNum = fluids.courantNo(dt0, meanCo);
+        scalar DiNum = energy.solidDiffNo(dt0, meanDi);
         if (adjustTimeStep)
         {
-            const scalar dt0 = runTime.deltaTValue();
-            scalar meanCo = 0, meanDi = 0;
-            scalar CoNum = fluids.courantNo(dt0, meanCo);
-            scalar DiNum = energy.solidDiffNo(dt0, meanDi);
             if (CoNum == -GREAT) CoNum = SMALL;
             if (DiNum == -GREAT) DiNum = SMALL;
             const scalar maxDeltaTFluid = maxCo/(CoNum + SMALL);
@@ -140,6 +198,7 @@ int main(int argc, char *argv[])
         engine.energyStoreOld();
         fluids.storeOld(dt);
         fluids.hvacControl(runTime.value() - dt, dt);
+        timer.mark("old time level, HVAC");
 
         for (label oCorr = 0; oCorr < nOuterCorr; ++oCorr)
         {
@@ -151,7 +210,9 @@ int main(int argc, char *argv[])
             }
 
             fluids.momentum(dt, finalIter);
+            timer.mark("momentum");
             fluids.species(dt, finalIter);
+            timer.mark("species");
 
             fluids.toEnergy(dt);
             energy.updateBCs();
@@ -161,10 +222,16 @@ int main(int argc, char *argv[])
             Info<< "\nSolving energy (all regions)" << nl
                 << ctl.name.c_str() << ":  Solving for h, Initial residual = " << si.res0
                 << ", Final residual = " << si.res << ", No Iterations " << si.iters << endl;
+            // one system for all regions: every region reports it as its h solve
+            const SolverPerformance<scalar> hPerf(ctl.name, "h", si.res0, si.res, si.iters, gpuCht::converged(ctl, si));
+            forAll(meshes, i) meshes[i].data().setSolverPerformance("h", hPerf);
             energy.logMinMax();
+            timer.mark("energy");
 
             fluids.pressure(dt, finalIter);
+            timer.mark("pressure");
             fluids.turbulence(dt, finalIter);
+            timer.mark("turbulence");
 
             if (ocrc && !finalIter && fluids.outerConverged(*ocrc, si.res0))
             {
@@ -173,14 +240,32 @@ int main(int argc, char *argv[])
             }
         }
 
-        if (runTime.writeTime())
+        // the device holds the fields; OpenFOAM's copies are refreshed for writing and, while there are
+        // functionObjects, every time step (Time::run executes them at the start of the next step)
+        const functionObjectList& fos = runTime.functionObjects();
+        if (runTime.writeTime() || (fos.status() && !fos.empty()))
         {
             energy.writeBack();
             fluids.writeBack();
         }
+        timer.mark("device -> OpenFOAM fields");
         runTime.write();
+        timer.mark("write");
+        ++nSteps;
+        if (nSteps == 1)
+        {
+            // the linear-solver structures (AMG hierarchies, colourings, work vectors) exist from the first step on
+            Info<< "device memory after the first time step: " << engine.memGB() << " GB" << nl << endl;
+        }
 
         runTime.printExecutionTime(Info);
+    }
+    timer.mark("functionObjects");
+    timer.report(nSteps);
+    const std::string prof = engine.profReport();
+    if (!prof.empty())
+    {
+        Info<< "Library scopes (GPUCHT_PROF, inclusive):" << nl << prof.c_str() << endl;
     }
 
     Info<< "End\n" << endl;
