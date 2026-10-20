@@ -1,0 +1,9 @@
+# Object files & OpenFOAM wmake intermediates
+*.o
+*.d
+*.dep
+app/**/Make/linux*
+cases/
+
+# Keep compiled binaries in build/omp and build/cuda, ignore object files
+build/**/*.o

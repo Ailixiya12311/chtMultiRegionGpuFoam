@@ -1,0 +1,6 @@
+regions.C
+energyCoupling.C
+fluidCoupling.C
+chtMultiRegionGpuFoam.C
+
+EXE = $(GCOF_BIN)/chtMultiRegionGpuFoam
