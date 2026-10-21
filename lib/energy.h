@@ -27,6 +27,10 @@ struct Energy
     dvec<double> bVal, bGrad, bVf, cpB, eB, kappaB, alphatB;
     // interface faces
     dvec<double> Rlayer, qIface, kappaWall;   // kappaWall < 0: fluid side uses kappa of the cell
+    // linearised surface exchange w [W/K] of a face without layers: its surface node takes w (Tref - T_s) besides
+    // qIface, solved with the two sides (T_s = (gA T_A + gB T_B + qIface)/(gA + gB + w)), so Tref = Tmrt enters
+    // through qIface (Building, interior longwave)
+    dvec<double> wRad;
     // fluid mass flux on fluid faces (global face ids; zero elsewhere), convection scheme
     dvec<double> phi;                         // nI + nB
     int conv = 0;                             // 0 upwind, 1 linearUpwind, 2 linear, 3 limitedLinear

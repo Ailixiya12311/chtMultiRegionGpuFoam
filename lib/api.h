@@ -100,8 +100,8 @@ enum class A
     rLimitK, rPsi, rRelax,
     // per boundary face
     bVal, bGrad, bVf, cpB, eB, kappaB, alphatB, TbB,
-    // per interface face
-    Rlayer, qIface, kappaWall, TA, TB,
+    // per interface face (wRad: linearised surface exchange of a face without layers, Energy::wRad)
+    Rlayer, qIface, wRad, kappaWall, TA, TB,
     // per face (nI + nB): fluid mass flux for the energy convection
     phi
 };

@@ -1,5 +1,6 @@
 // Library self-test without OpenFOAM:
-//  1. two-material bar (two regions, one interface), steady conduction, fixed ends: exact linear profiles
+//  1. two-material bar (two regions, one interface), steady conduction, fixed ends: exact linear profiles;
+//     1b. the same with a linearised surface exchange and a heat flow at the interface face
 //  2. n^3 cube with a heat source, steady: PCG+Jacobi vs PCG+AMG vs BiCGStab+AMG (same solution, iterations, time)
 //  3. ShadowMap synthetic tests (cube on ground & room with glazing window)
 #include <chrono>
@@ -207,6 +208,38 @@ int main()
         printf("bar: res0 %.3e res %.3e iters %d  max |T - exact| = %.3e  interface T %.10f (exact 20)\n",
                inf.res0, inf.res, inf.iters, err, TA[0]);
         if (err > 1e-9 || std::fabs(TA[0] - 20.0) > 1e-9) { printf("  FAIL\n"); ++fails; }
+    }
+    // ---------------------------------------------------------------- 1b. bar with surface exchange at the interface
+    // the interface face also exchanges w (Tref - Ts) and takes q0 (Energy::wRad, as the interior longwave star node):
+    // Ts = (2*100 + w Tref + q0)/(2 + 8 + w), the two sides conducting k/0.5 = 2 and 8; w well above both
+    {
+        const int nx = 10;
+        MeshIn m = box(nx, 1, 1, 1.0, nx/2);
+        Engine E(m);
+        setup(E, m, {1.0, 4.0}, 100.0, 0.0);
+        const double w = 25.0, Tref = 60.0, q0 = 30.0;
+        E.put(A::wRad, std::vector<double>(m.nIface, w));
+        E.put(A::qIface, std::vector<double>(m.nIface, q0 + w*Tref));
+        SolverCtl s;
+        s.method = SolverCtl::PBICGSTAB;
+        s.precond = SolverCtl::JACOBI;
+        s.tol = 1e-14;
+        s.maxIter = 1000;
+        SolveInfo inf = E.energySolve(0.0, s, false);
+        std::vector<double> T = E.get(A::T);
+        const double Ts = (200.0 + w*Tref + q0)/(10.0 + w);
+        double err = 0;
+        for (int c = 0; c < m.nC; ++c)
+        {
+            const double x = m.C[3*c];
+            const double ex = x < 0.5 ? 100.0 - (100.0 - Ts)*x/0.5 : Ts*(1.0 - (x - 0.5)/0.5);
+            err = std::max(err, std::fabs(T[c] - ex));
+        }
+        std::vector<double> TA, TB, gA, gB;
+        E.interfaceState(TA, TB, gA, gB);
+        printf("bar + surface exchange: iters %d  max |T - exact| = %.3e  interface T %.10f (exact %.10f)\n",
+               inf.iters, err, TA[0], Ts);
+        if (err > 1e-9 || std::fabs(TA[0] - Ts) > 1e-9 || std::fabs(TB[0] - Ts) > 1e-9) { printf("  FAIL\n"); ++fails; }
     }
     // ---------------------------------------------------------------- 2. cube
     {

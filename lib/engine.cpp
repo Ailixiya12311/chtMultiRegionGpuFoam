@@ -122,6 +122,7 @@ struct Engine::Impl
             case A::TbB: return E.TbB;
             case A::Rlayer: return E.Rlayer;
             case A::qIface: return E.qIface;
+            case A::wRad: return E.wRad;
             case A::kappaWall: return E.kappaWall;
             case A::TA: return E.TA;
             case A::TB: return E.TB;

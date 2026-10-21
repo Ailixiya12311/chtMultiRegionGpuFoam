@@ -3,6 +3,7 @@
 #include "emptyFvPatch.H"
 #include "leastSquaresVectors.H"
 #include "mappedPatchBase.H"
+#include "matchPoints.H"
 
 namespace Foam
 {
@@ -125,6 +126,36 @@ void buildGlobalMesh(List<Region>& R, gc::MeshIn& mi)
         const mappedPatchBase& mpb = refCast<const mappedPatchBase>(mA.boundaryMesh()[pr.pA]);
         labelList nbr(identity(fB.size()));
         mpb.distribute(nbr);
+        // nearestPatchFace samples the face nearest to each face centre; where a centre lies outside its own face
+        // (e.g. a concave face at a hanging node) that can be a neighbouring face, so two faces sample the same one.
+        // The coupling here needs the conformal partner: pair such interfaces by face centre instead.
+        {
+            boolList seen(fB.size(), false);
+            label nDup = 0;
+            forAll(nbr, i)
+            {
+                const label j = nbr[i];
+                if (j < 0 || j >= fB.size() || seen[j]) nDup++;
+                else seen[j] = true;
+            }
+            if (nDup)
+            {
+                scalarField tol(n);
+                forAll(tol, i) tol[i] = 1e-6*Foam::sqrt(fA.magSf()[i]);
+                labelList byCentre;
+                if (!matchPoints(fA.Cf(), fB.Cf(), tol, false, byCentre))
+                    FatalErrorInFunction << "interface " << mA.name() << "/" << fA.name() << " <-> " << mB.name() << "/"
+                        << fB.name() << ": mapping is not one-to-one (" << nDup << " faces) and the face centres do not"
+                        << " match either" << exit(FatalError);
+                label nDiff = 0;
+                forAll(nbr, i) if (nbr[i] != byCentre[i]) nDiff++;
+                Info<< "interface " << mA.name() << "/" << fA.name() << " <-> " << mB.name() << "/" << fB.name()
+                    << ": the mapped-patch map is not one-to-one (" << nDup
+                    << " repeated faces); paired by face centre, " << nDiff << " of " << n
+                    << " faces differ from OpenFOAM's map" << endl;
+                nbr.transfer(byCentre);
+            }
+        }
         // conformal check
         boolList used(fB.size(), false);
         scalar dCmax = 0, dSmax = 0;

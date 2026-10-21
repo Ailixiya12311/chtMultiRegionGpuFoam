@@ -584,6 +584,7 @@ void Building::updateEnergy(Energy& E, double t, const std::vector<double>& zone
         const char* ao = ptr(iAirOwner);
         const double *Tc = ptr(E.T), *go = ptr(E.gA), *gn = ptr(E.gB), *Gs = ptr(E.G), *Rl = ptr(E.Rlayer);
         double* qi = ptr(E.qIface);
+        double* wr = ptr(E.wRad);
         double* ts = ptr(Ts);
         for_n(nI_, [=] HD (long k) {
             const int j = ip[k];
@@ -591,7 +592,7 @@ void Building::updateEnergy(Energy& E, double t, const std::vector<double>& zone
             const int o = g.own[f], n = g.nei[f];
             const double R = Rl[j];
             if (R == 0.0)
-                ts[k] = (go[j]*Tc[o] + gn[j]*Tc[n] + qi[j])/(go[j] + gn[j]);
+                ts[k] = (go[j]*Tc[o] + gn[j]*Tc[n] + qi[j])/(go[j] + gn[j] + wr[j]);
             else
             {
                 const double Q = (Tc[o] - Tc[n])*Gs[j];
@@ -627,11 +628,22 @@ void Building::updateEnergy(Energy& E, double t, const std::vector<double>& zone
                 }
                 tmrt[z] = sWT/dmax(sW, 1e-300);
             });
+            // the longwave exchange w (Tmrt - T_s) is solved with the face (Energy::wRad) instead of lagged one outer
+            // corrector: lagged, T_s overshoots by -w/(gA + gB) each corrector, which diverges where the conductances
+            // of the two sides are below w (about 5.6 W/m2K: a well insulated roof under a coarse air cell, whole
+            // building 10-20). Faces with layers keep the lagged form (their T_s does not take qIface).
             for_n(nI_, [=] HD (long k) {
                 const int z = iz[k];
+                const int j = ip[k];
                 const double w = 4.0*ie[k]*SIGMA_SB*tz3[z]*ia[k];
-                const double q = absI[k] + w*(tmrt[z] - ts[k]) + (zq[z]/dmax(za[z], 1e-300))*ia[k];
-                qi[ip[k]] = q;
+                const double base = absI[k] + (zq[z]/dmax(za[z], 1e-300))*ia[k];
+                if (Rl[j] == 0.0)
+                {
+                    wr[j] = w;
+                    qi[j] = base + w*tmrt[z];
+                }
+                else
+                    qi[j] = base + w*(tmrt[z] - ts[k]);
             });
         }
         else

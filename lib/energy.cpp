@@ -17,7 +17,7 @@ struct EV                                     // raw view for kernels
     const double *rLimitK, *rPsi, *rRelax;
     const int* bKind;
     const double *bVal, *bGrad, *cpB, *eB, *kappaB, *alphatB;
-    const double *Rlayer, *qIface, *kappaWall, *phi;
+    const double *Rlayer, *qIface, *wRad, *kappaWall, *phi;
     double *bVf, *aB, *bB, *TbB, *GbB, *gA, *gB, *G, *TA, *TB, *h, *grad;
     int conv;
     double convK;
@@ -36,7 +36,7 @@ EV ev(Energy& E)
     v.bKind = ptr(E.bKind);
     v.bVal = ptr(E.bVal); v.bGrad = ptr(E.bGrad); v.bVf = ptr(E.bVf); v.cpB = ptr(E.cpB); v.eB = ptr(E.eB);
     v.kappaB = ptr(E.kappaB); v.alphatB = ptr(E.alphatB);
-    v.Rlayer = ptr(E.Rlayer); v.qIface = ptr(E.qIface); v.kappaWall = ptr(E.kappaWall); v.phi = ptr(E.phi);
+    v.Rlayer = ptr(E.Rlayer); v.qIface = ptr(E.qIface); v.wRad = ptr(E.wRad); v.kappaWall = ptr(E.kappaWall); v.phi = ptr(E.phi);
     v.aB = ptr(E.aB); v.bB = ptr(E.bB); v.TbB = ptr(E.TbB); v.GbB = ptr(E.GbB);
     v.gA = ptr(E.gA); v.gB = ptr(E.gB); v.G = ptr(E.G); v.TA = ptr(E.TA); v.TB = ptr(E.TB);
     v.h = ptr(E.h); v.grad = ptr(E.grad);
@@ -182,7 +182,7 @@ void Energy::init(const DMesh& mesh, int nRegions)
         a->resize(nB);
         fill(*a, 0.0);
     }
-    for (auto* a : {&Rlayer, &qIface, &gA, &gB, &G, &TA, &TB})
+    for (auto* a : {&Rlayer, &qIface, &wRad, &gA, &gB, &G, &TA, &TB})
     {
         a->resize(nIf);
         fill(*a, 0.0);
@@ -237,13 +237,14 @@ void Energy::boundaryState()
         }
         const double go = ko*g.dcIA[j]*S, gn = kn*g.dcIB[j]*S;
         const double R = v.Rlayer[j];
-        const double Gs = 1.0/(1.0/go + 1.0/gn + R/S);
+        const double w = v.wRad[j];           // > 0 only without layers
+        const double Gs = w > 0 ? go*gn/(go + gn + w) : 1.0/(1.0/go + 1.0/gn + R/S);
         v.gA[j] = go;
         v.gB[j] = gn;
         v.G[j] = Gs;
         if (R == 0.0)
         {
-            const double t = (go*v.T[o] + gn*v.T[n] + v.qIface[j])/(go + gn);
+            const double t = (go*v.T[o] + gn*v.T[n] + v.qIface[j])/(go + gn + w);
             v.TA[j] = t;
             v.TB[j] = t;
         }
@@ -358,16 +359,24 @@ void Energy::assemble(double dt)
             else if (ent >= 0 && ent < g.nI)  // interface, side A
             {
                 const int j = ent - g.nIr;
-                bD += v.G[j];
-                bA += v.G[j];
-                bS += v.qIface[j]*v.gA[j]/(v.gA[j] + v.gB[j]);
+                // eliminating the surface node: side A takes gA (T_s - T_A) = G (T_B - T_A) - gA w/(gA + gB + w) T_A
+                // + gA qIface/(gA + gB + w)
+                const double w = v.wRad[j];
+                const double den = v.gA[j] + v.gB[j] + w;
+                const double d = w > 0 ? v.gA[j]*w/den : 0.0;
+                bD += v.G[j] + d;
+                bA += v.G[j] + d;
+                bS += v.qIface[j]*v.gA[j]/den;
             }
             else if (ent < 0)                 // interface, side B
             {
                 const int j = -ent - 1 - g.nIr;
-                bD += v.G[j];
-                bA += v.G[j];
-                bS += v.qIface[j]*v.gB[j]/(v.gA[j] + v.gB[j]);
+                const double w = v.wRad[j];
+                const double den = v.gA[j] + v.gB[j] + w;
+                const double d = w > 0 ? v.gB[j]*w/den : 0.0;
+                bD += v.G[j] + d;
+                bA += v.G[j] + d;
+                bS += v.qIface[j]*v.gB[j]/den;
             }
             else                              // boundary face
             {
